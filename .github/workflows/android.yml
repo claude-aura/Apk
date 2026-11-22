@@ -1,0 +1,1727 @@
+# NOTCH CIRCLE. Coloque este arquivo em .github/workflows/android.yml
+# Ele monta o projeto Android, compila na nuvem e publica o APK em "Releases" (e como artefato).
+name: Gerar APK do NOTCH CIRCLE
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Criar o projeto Android
+        run: |
+          mkdir -p app app/src/main app/src/main/java/com/notchcircle app/src/main/res/values app/src/main/res/xml
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "NotchCircle"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g
+          kotlin.code.style=official
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.notchcircle"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.notchcircle"
+                  minSdk = 31
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" />
+              <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@android:drawable/ic_menu_compass"
+                  android:label="@string/app_name">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <activity android:name=".AppsActivity" android:exported="false" android:label="Escolher apps" />
+
+                  <service
+                      android:name=".NotchService"
+                      android:exported="false"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+
+                  <service
+                      android:name=".NotifService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/notchcircle/AppsActivity.kt <<'EOF'
+          package com.notchcircle
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.drawable.Drawable
+          import android.os.Bundle
+          import android.text.Editable
+          import android.text.TextWatcher
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.BaseAdapter
+          import android.widget.CheckBox
+          import android.widget.EditText
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.ListView
+          import android.widget.TextView
+
+          /** Lista os apps instalados; os marcados são onde o gato aparece (no modo "só nos apps escolhidos"). */
+          class AppsActivity : Activity() {
+              private class Item(val label: String, val pkg: String, val icon: Drawable)
+              private class Row(val icon: ImageView, val name: TextView, val chk: CheckBox)
+
+              private val all = ArrayList<Item>()
+              private val shown = ArrayList<Item>()
+              private val sel = HashSet<String>()
+              private lateinit var adapter: BaseAdapter
+              private lateinit var key: String
+
+              private fun dp(x: Int) = (x * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  Prefs.init(this)
+                  key = intent.getStringExtra("key") ?: "sel_notif"
+                  sel.addAll(Prefs.strs(key))
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.fitsSystemWindows = true
+                  root.setPadding(dp(12), dp(12), dp(12), 0)
+                  val info = TextView(this)
+                  info.text = intent.getStringExtra("title") ?: "Marque os apps."
+                  val search = EditText(this)
+                  search.hint = "Buscar app…"
+                  search.setSingleLine()
+                  val list = ListView(this)
+                  root.addView(info)
+                  root.addView(search)
+                  root.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+                  setContentView(root)
+
+                  adapter = object : BaseAdapter() {
+                      override fun getCount() = shown.size
+                      override fun getItem(position: Int): Any = shown[position]
+                      override fun getItemId(position: Int) = position.toLong()
+                      override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                          val row: Row
+                          val v: View
+                          if (convertView == null) {
+                              val box = LinearLayout(this@AppsActivity)
+                              box.orientation = LinearLayout.HORIZONTAL
+                              box.gravity = Gravity.CENTER_VERTICAL
+                              box.setPadding(0, dp(6), 0, dp(6))
+                              val ic = ImageView(this@AppsActivity)
+                              val nm = TextView(this@AppsActivity)
+                              nm.setPadding(dp(12), 0, dp(12), 0)
+                              val ck = CheckBox(this@AppsActivity)
+                              ck.isClickable = false
+                              ck.isFocusable = false
+                              box.addView(ic, LinearLayout.LayoutParams(dp(40), dp(40)))
+                              box.addView(nm, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                              box.addView(ck)
+                              row = Row(ic, nm, ck)
+                              box.tag = row
+                              v = box
+                          } else {
+                              v = convertView
+                              row = convertView.tag as Row
+                          }
+                          val item = shown[position]
+                          row.icon.setImageDrawable(item.icon)
+                          row.name.text = item.label
+                          row.chk.isChecked = sel.contains(item.pkg)
+                          return v
+                      }
+                  }
+                  list.adapter = adapter
+                  list.setOnItemClickListener { _, _, pos, _ ->
+                      val pkg = shown[pos].pkg
+                      if (!sel.add(pkg)) sel.remove(pkg)
+                      Prefs.putStrs(key, sel)
+                      NotchService.instance?.refresh()
+                      adapter.notifyDataSetChanged()
+                  }
+                  search.addTextChangedListener(object : TextWatcher {
+                      override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
+                      override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) {}
+                      override fun afterTextChanged(s: Editable?) { filter(s?.toString() ?: "") }
+                  })
+
+                  Thread {
+                      val pm = packageManager
+                      val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                      val seen = HashSet<String>()
+                      val tmp = ArrayList<Item>()
+                      for (ri in pm.queryIntentActivities(intent, 0)) {
+                          val p = ri.activityInfo.packageName
+                          if (p == packageName || !seen.add(p)) continue
+                          tmp.add(Item(ri.loadLabel(pm).toString(), p, ri.loadIcon(pm)))
+                      }
+                      tmp.sortBy { it.label.lowercase() }
+                      runOnUiThread {
+                          all.addAll(tmp)
+                          filter(search.text.toString())
+                      }
+                  }.start()
+              }
+
+              private fun filter(q: String) {
+                  shown.clear()
+                  val k = q.trim().lowercase()
+                  for (i in all) if (k.isEmpty() || i.label.lowercase().contains(k)) shown.add(i)
+                  adapter.notifyDataSetChanged()
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/notchcircle/MainActivity.kt <<'EOF'
+          package com.notchcircle
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.AppOpsManager
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Typeface
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.Process
+          import android.provider.Settings
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.Switch
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.io.File
+          import java.io.FileOutputStream
+
+          class MainActivity : Activity() {
+              private lateinit var status: TextView
+              private lateinit var col: LinearLayout
+              private val checks = ArrayList<Triple<TextView, String, () -> Boolean>>()
+              private val imgIds = mapOf(100 to "bat", 101 to "n4", 102 to "n3", 103 to "n2", 104 to "n1", 105 to "n0", 106 to "nx")
+
+              private fun dp(x: Int) = (x * resources.displayMetrics.density).toInt()
+
+              private fun LinearLayout.add(v: View, top: Int = 8) {
+                  addView(v, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                      .apply { topMargin = dp(top) })
+              }
+
+              private fun txt(s: String, size: Float = 0f, bold: Boolean = false) = TextView(this).apply {
+                  text = s
+                  if (size > 0f) textSize = size
+                  if (bold) setTypeface(typeface, Typeface.BOLD)
+              }
+
+              private fun head(s: String) = col.add(txt(s, 20f, true), 24)
+
+              private fun btn(s: String, onClick: () -> Unit) = Button(this).apply {
+                  text = s
+                  minHeight = dp(48)
+                  setOnClickListener { onClick() }
+              }
+
+              private fun upd(images: Boolean = false) {
+                  NotchService.instance?.refresh(images)
+              }
+
+              private fun tog(label: String, key: String, def: Boolean) = Switch(this).apply {
+                  text = label
+                  isChecked = Prefs.bool(key, def)
+                  minHeight = dp(48)
+                  setOnCheckedChangeListener { _, c -> Prefs.putBool(key, c); upd() }
+              }
+
+              private fun sld(name: String, key: String, lo: Int, hi: Int, def: Int, unit: String): LinearLayout {
+                  val box = LinearLayout(this)
+                  box.orientation = LinearLayout.VERTICAL
+                  val v = Prefs.int(key, def)
+                  val t = txt("$name: $v$unit")
+                  val s = SeekBar(this)
+                  s.min = lo
+                  s.max = hi
+                  s.progress = v
+                  s.contentDescription = name
+                  s.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                          t.text = "$name: $p$unit"
+                          if (fromUser) { Prefs.putInt(key, p); upd() }
+                      }
+                      override fun onStartTrackingTouch(sb: SeekBar?) {}
+                      override fun onStopTrackingTouch(sb: SeekBar?) {}
+                  })
+                  box.addView(t)
+                  box.addView(s)
+                  return box
+              }
+
+              private fun cyc(title: String, key: String, names: List<String>): Button {
+                  val b = btn("") {}
+                  val show = { b.text = title + ": " + names[Prefs.int(key, 0).coerceIn(0, names.size - 1)] }
+                  show()
+                  b.setOnClickListener {
+                      Prefs.putInt(key, (Prefs.int(key, 0) + 1) % names.size)
+                      show()
+                      upd()
+                  }
+                  return b
+              }
+
+              private fun apps(key: String, title: String) = Intent(this, AppsActivity::class.java).putExtra("key", key).putExtra("title", title)
+
+              private fun perm(title: String, ok: () -> Boolean, action: () -> Unit) {
+                  val t = txt("")
+                  checks.add(Triple(t, title, ok))
+                  col.add(t)
+                  col.add(btn("Abrir: $title", action), 4)
+              }
+
+              private fun accOn(): Boolean {
+                  val s = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: ""
+                  return s.contains(packageName) && s.contains("NotchService")
+              }
+
+              private fun notifOn(): Boolean =
+                  (Settings.Secure.getString(contentResolver, "enabled_notification_listeners") ?: "").contains(packageName)
+
+              @Suppress("DEPRECATION")
+              private fun usageOn(): Boolean = try {
+                  val ops = getSystemService(APP_OPS_SERVICE) as AppOpsManager
+                  ops.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), packageName) == AppOpsManager.MODE_ALLOWED
+              } catch (_: Exception) { false }
+
+              private fun image(label: String, code: Int) = btn(label) { pick(code) }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  Prefs.init(this)
+                  col = LinearLayout(this)
+                  col.orientation = LinearLayout.VERTICAL
+                  col.setPadding(dp(16), dp(16), dp(16), dp(40))
+                  val scroll = ScrollView(this)
+                  scroll.fitsSystemWindows = true
+                  scroll.addView(col)
+                  setContentView(scroll)
+
+                  col.add(txt("NOTCH CIRCLE", 28f, true))
+                  col.add(txt("Painéis circulares e indicadores por cima dos apps. Cada recurso liga e desliga sozinho."))
+                  status = txt("", 0f, true)
+                  col.add(status)
+                  col.add(tog("Ligar o NOTCH CIRCLE (geral)", "enabled", true))
+                  col.add(tog("Modo de edição: arraste cada elemento na tela (prévia ao vivo)", "editing", false))
+                  col.add(txt("Desligue o modo de edição quando terminar. Nele, os gestos e botões não funcionam."))
+                  col.add(btn("Voltar todas as posições ao padrão") { Prefs.resetPositions(); upd() })
+
+                  head("1. Notificações circulares")
+                  col.add(tog("Ativar a área do gesto (dois círculos perto da câmera)", "zone_on", true))
+                  col.add(sld("Tamanho da área", "zone_size", 60, 260, 120, " dp"))
+                  col.add(sld("Sensibilidade (maior = reconhece círculos mais abertos)", "z_sens", 1, 10, 5, ""))
+                  col.add(sld("Tempo máximo entre os dois círculos", "z_gap", 300, 2500, 1200, " ms"))
+                  col.add(sld("Escurecer o fundo", "dim", 0, 60, 20, "%"))
+                  col.add(sld("Tamanho do círculo", "n_radius", 90, 220, 140, " dp"))
+                  col.add(sld("Notificações por página", "n_per", 4, 12, 8, ""))
+                  col.add(txt("A posição da área muda no modo de edição. A área captura os toques dentro dela, então deixe pequena. Toque abre, segure mostra prévia, arraste pra fora dispensa."))
+                  col.add(btn("Abrir o painel de notificações agora (teste)") {
+                      val s = NotchService.instance
+                      if (s == null) Toast.makeText(this, "Ligue o serviço de acessibilidade primeiro.", Toast.LENGTH_LONG).show()
+                      else s.openRing(0)
+                  })
+
+                  head("2. Seletor circular de apps")
+                  col.add(tog("Ativar o botão do seletor", "btn_on", false))
+                  col.add(sld("Tempo segurando pra abrir", "btn_hold", 300, 3000, 1000, " ms"))
+                  col.add(sld("Tamanho do botão", "btn_size", 32, 120, 56, " dp"))
+                  col.add(sld("Tamanho do círculo", "a_radius", 90, 220, 130, " dp"))
+                  col.add(sld("Apps por página", "a_per", 4, 14, 10, ""))
+                  col.add(txt("Arraste um app pro quadrado do centro pra tirá-lo do círculo. O Android não deixa remover apps dos recentes do sistema, então ele só some daqui."))
+                  col.add(btn("Trazer de volta os apps removidos do círculo") { Prefs.putStrs("ring_hidden", emptySet()) })
+
+                  head("3. Bateria")
+                  col.add(tog("Mostrar a bateria", "bat_on", false))
+                  col.add(sld("Tamanho", "bat_size", 14, 80, 28, " dp"))
+                  col.add(tog("Mostrar a porcentagem", "bat_pct", true))
+                  col.add(image("Usar minha imagem de bateria", 100))
+
+                  head("4. Relógio")
+                  col.add(tog("Mostrar o relógio", "clk_on", false))
+                  col.add(sld("Tamanho do texto", "clk_size", 10, 80, 22, " sp"))
+                  col.add(tog("Formato de 24 horas", "clk_24", true))
+
+                  head("5. Tempo nos aplicativos")
+                  col.add(tog("Mostrar o tempo no app atual", "tim_on", false))
+                  col.add(sld("Tamanho do texto", "tim_size", 10, 60, 16, " sp"))
+                  col.add(tog("Mostrar também o total do dia nesse app", "tim_day", false))
+                  col.add(tog("Formato por extenso (12 min 30 s)", "tim_long", false))
+
+                  head("6. Conexão")
+                  col.add(tog("Mostrar o indicador de internet", "net_on", false))
+                  col.add(sld("Tamanho", "net_size", 16, 100, 28, " dp"))
+                  col.add(cyc("Fonte", "net_src", listOf("Automática", "Só Wi-Fi", "Só rede móvel")))
+                  col.add(txt("Imagens por nível (padrão: formiga com folha, semente, pedra, metal, exclamação):"))
+                  col.add(image("Imagem: 4 pontos", 101))
+                  col.add(image("Imagem: 3 pontos", 102))
+                  col.add(image("Imagem: 2 pontos", 103))
+                  col.add(image("Imagem: 1 ponto", 104))
+                  col.add(image("Imagem: 0 pontos", 105))
+                  col.add(image("Imagem: sem conexão", 106))
+                  col.add(btn("Voltar às imagens padrão (bateria e conexão)") {
+                      for (id in imgIds.values) File(filesDir, "img_$id").delete()
+                      upd(true)
+                  })
+
+                  head("7. Personalização")
+                  col.add(txt("Arraste tudo no modo de edição (ligado lá em cima). O tamanho de cada item é o controle de tamanho da sua seção. Imagens PNG, JPG e WEBP."))
+                  col.add(btn("Restaurar TODAS as configurações padrão") {
+                      Prefs.resetAll()
+                      upd(true)
+                      recreate()
+                  })
+
+                  head("8. Privacidade")
+                  col.add(tog("Ler notificações", "n_read", true))
+                  col.add(cyc("Conteúdo das notificações", "n_priv", listOf("Normal", "Modo privado (ocultar o texto)", "Só ícone e quantidade")))
+                  col.add(tog("Mostrar só os apps que eu escolher", "n_only", false))
+                  col.add(btn("Escolher apps que podem aparecer nas notificações") {
+                      startActivity(apps("sel_notif", "Apps que podem aparecer no círculo de notificações."))
+                  })
+                  col.add(tog("Esconder indicadores nos apps que eu escolher", "hide_on", false))
+                  col.add(btn("Escolher apps onde os indicadores somem") {
+                      startActivity(apps("sel_hide", "Nestes apps, bateria, relógio, tempo e internet ficam escondidos."))
+                  })
+
+                  head("9. Permissões")
+                  perm("Serviço de acessibilidade (obrigatório)", { accOn() }) { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  perm("Acesso a notificações", { notifOn() }) { startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }
+                  perm("Aparecer sobre outros apps (ajuda a abrir os apps)", { Settings.canDrawOverlays(this) }) {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                  }
+                  perm("Acesso ao uso (ordena os apps pelos mais recentes)", { usageOn() }) { startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)) }
+                  perm("Telefone (sinal da rede móvel)", { checkSelfPermission(Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED }) {
+                      requestPermissions(arrayOf(Manifest.permission.READ_PHONE_STATE), 9)
+                  }
+                  col.add(txt("Se o botão da acessibilidade ficar cinza, vá em Ajustes > Apps > NOTCH CIRCLE > 3 pontinhos > Permitir configurações restritas."))
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  val on = accOn() && Prefs.bool("enabled", true)
+                  status.text = if (on) "Estado: ATIVO ✔" else if (!accOn()) "Estado: INATIVO. Ligue o serviço de acessibilidade (seção Permissões)." else "Estado: DESLIGADO no botão geral."
+                  for ((tv, title, ok) in checks) tv.text = (if (ok()) "✔ " else "✖ ") + title
+                  NotchService.instance?.setForeground(packageName)
+              }
+
+              private fun pick(code: Int) {
+                  val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                  i.addCategory(Intent.CATEGORY_OPENABLE)
+                  i.type = "image/*"
+                  @Suppress("DEPRECATION")
+                  startActivityForResult(i, code)
+              }
+
+              @Suppress("DEPRECATION")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  val id = imgIds[requestCode] ?: return
+                  if (resultCode != RESULT_OK) return
+                  val uri = data?.data ?: return
+                  try {
+                      contentResolver.openInputStream(uri)?.use { inp ->
+                          FileOutputStream(File(filesDir, "img_$id")).use { out -> inp.copyTo(out) }
+                      }
+                      upd(true)
+                      Toast.makeText(this, "Pronto!", Toast.LENGTH_SHORT).show()
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Não consegui abrir essa imagem.", Toast.LENGTH_LONG).show()
+                  }
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/notchcircle/NotchService.kt <<'EOF'
+          package com.notchcircle
+
+          import android.accessibilityservice.AccessibilityService
+          import android.app.Notification
+          import android.app.usage.UsageStatsManager
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.res.Configuration
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.net.ConnectivityManager
+          import android.net.Network
+          import android.net.NetworkCapabilities
+          import android.net.wifi.WifiManager
+          import android.os.BatteryManager
+          import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.telephony.TelephonyManager
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.WindowManager.LayoutParams as LP
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.inputmethod.InputMethodManager
+          import android.widget.TextView
+          import java.io.File
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          private class Elem(val id: String, val view: View, val lp: LP)
+
+          /**
+           * O coração do NOTCH CIRCLE (serviço de acessibilidade):
+           *  - área de gesto perto da câmera (dois círculos abrem o painel de notificações);
+           *  - botão do seletor de apps (segurar abre o círculo de apps);
+           *  - indicadores: bateria, relógio, tempo no app e internet;
+           *  - sabe qual app está na frente (pra contar o tempo e esconder indicadores).
+           */
+          class NotchService : AccessibilityService() {
+              companion object {
+                  var instance: NotchService? = null
+                  private val FLAGS = LP.FLAG_NOT_FOCUSABLE or LP.FLAG_LAYOUT_IN_SCREEN or LP.FLAG_LAYOUT_NO_LIMITS
+                  val DEF = mapOf("zone" to 120, "btn" to 56, "bat" to 28, "clk" to 22, "tim" to 16, "net" to 28)
+              }
+
+              private val ui = Handler(Looper.getMainLooper())
+              private var wm: WindowManager? = null
+              private val elems = ArrayList<Elem>()
+              private val ignore = HashSet<String>()
+              private var ready = false
+              private var fg: String? = null
+              private var panel: RingView? = null
+              private var screenOn = true
+              private var tickRunning = false
+
+              private lateinit var zoneV: ZoneView
+              private lateinit var btnV: BtnView
+              private lateinit var batV: BatteryView
+              private lateinit var clkV: TextView
+              private lateinit var timV: TextView
+              private lateinit var netV: NetView
+
+              // tempo de uso
+              private var curPkg: String? = null
+              private var curStart = -1L
+              private var sessStart = 0L
+
+              private val detector = CircleDetector { openRing(0) }
+              private val openApps = Runnable { openRing(1) }
+              private val zoneTouch = View.OnTouchListener { _, e -> detector.onTouch(e); true }
+              private val btnTouch = View.OnTouchListener { _, e ->
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> ui.postDelayed(openApps, Prefs.int("btn_hold", 1000).toLong())
+                      MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> ui.removeCallbacks(openApps)
+                  }
+                  true
+              }
+
+              private val tickRun = object : Runnable {
+                  var n = 0
+                  override fun run() {
+                      if (!ready || !screenOn || !anyTick()) { tickRunning = false; return }
+                      updateTexts()
+                      n++
+                      if (n % 5 == 0) updateNet()
+                      ui.postDelayed(this, 1000)
+                  }
+              }
+
+              private val batRcv = object : BroadcastReceiver() {
+                  override fun onReceive(c: Context?, i: Intent?) {
+                      if (i == null) return
+                      val lv = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+                      val sc = i.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
+                      val st = i.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+                      batV.level = if (lv >= 0) lv * 100 / maxOf(sc, 1) else 100
+                      batV.charging = st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL
+                      batV.invalidate()
+                  }
+              }
+
+              private val scrRcv = object : BroadcastReceiver() {
+                  override fun onReceive(c: Context?, i: Intent?) {
+                      when (i?.action) {
+                          Intent.ACTION_SCREEN_OFF -> {
+                              screenOn = false
+                              flush()
+                              curStart = -1L
+                              closeRing()
+                          }
+                          else -> {
+                              screenOn = true
+                              if (curPkg != null) curStart = SystemClock.uptimeMillis()
+                              startTick()
+                          }
+                      }
+                  }
+              }
+
+              private val netCb = object : ConnectivityManager.NetworkCallback() {
+                  override fun onAvailable(network: Network) { ui.post { updateNet() } }
+                  override fun onLost(network: Network) { ui.post { updateNet() } }
+                  override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) { ui.post { updateNet() } }
+              }
+
+              // ---------------------------------------------------------------- criação
+              private fun baseLp(): LP {
+                  val l = LP(LP.WRAP_CONTENT, LP.WRAP_CONTENT, LP.TYPE_ACCESSIBILITY_OVERLAY, FLAGS, PixelFormat.TRANSLUCENT)
+                  l.gravity = Gravity.TOP or Gravity.START
+                  if (Build.VERSION.SDK_INT >= 28) l.layoutInDisplayCutoutMode = LP.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                  return l
+              }
+
+              private fun add(id: String, v: View) {
+                  val lp = baseLp()
+                  wm?.addView(v, lp)
+                  elems.add(Elem(id, v, lp))
+              }
+
+              private fun label(): TextView {
+                  val t = TextView(this)
+                  t.setTextColor(Color.WHITE)
+                  t.setShadowLayer(5f, 0f, 0f, Color.BLACK)
+                  t.setPadding(8, 4, 8, 4)
+                  return t
+              }
+
+              private fun reg(r: BroadcastReceiver, f: IntentFilter): Intent? =
+                  if (Build.VERSION.SDK_INT >= 33) registerReceiver(r, f, Context.RECEIVER_NOT_EXPORTED) else registerReceiver(r, f)
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  Prefs.init(this)
+                  instance = this
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  try {
+                      val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
+                      imm.enabledInputMethodList.forEach { ignore.add(it.packageName) }
+                  } catch (_: Exception) { }
+                  ignore.add("com.android.systemui")
+                  ignore.add("android")
+                  ignore.add(packageName)
+
+                  zoneV = ZoneView(this); add("zone", zoneV)
+                  btnV = BtnView(this); add("btn", btnV)
+                  batV = BatteryView(this); add("bat", batV)
+                  clkV = label(); add("clk", clkV)
+                  timV = label(); add("tim", timV)
+                  netV = NetView(this); add("net", netV)
+                  ready = true
+
+                  reg(batRcv, IntentFilter(Intent.ACTION_BATTERY_CHANGED))?.let { batRcv.onReceive(this, it) }
+                  val sf = IntentFilter()
+                  sf.addAction(Intent.ACTION_SCREEN_OFF)
+                  sf.addAction(Intent.ACTION_SCREEN_ON)
+                  sf.addAction(Intent.ACTION_USER_PRESENT)
+                  reg(scrRcv, sf)
+                  try {
+                      (getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager).registerDefaultNetworkCallback(netCb)
+                  } catch (_: Exception) { }
+                  refresh(true)
+              }
+
+              // ---------------------------------------------------------------- posição e visibilidade
+              private fun orient() = if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) "_l" else "_p"
+
+              private fun elem(id: String): Elem = elems.first { it.id == id }
+
+              private fun size(id: String) = Prefs.int(id + "_size", DEF.getValue(id))
+
+              private fun dims(id: String, size: Int, dn: Float): Pair<Int, Int> = when (id) {
+                  "zone", "btn", "net" -> Pair((size * dn).toInt(), (size * dn).toInt())
+                  "bat" -> Pair((size * 2.6f * dn).toInt(), (size * dn).toInt())
+                  else -> Pair(LP.WRAP_CONTENT, LP.WRAP_CONTENT)
+              }
+
+              private fun defaultPos(id: String, w: Int, h: Int, dn: Float, sw: Int, sh: Int): Pair<Int, Int> = when (id) {
+                  "zone" -> Pair((sw - w) / 2, 0)
+                  "btn" -> Pair(sw - w - (12 * dn).toInt(), (sh * 0.4f).toInt())
+                  "bat" -> Pair(sw - w - (12 * dn).toInt(), (44 * dn).toInt())
+                  "net" -> Pair(sw - w - (12 * dn).toInt(), (8 * dn).toInt())
+                  "clk" -> Pair((12 * dn).toInt(), (44 * dn).toInt())
+                  else -> Pair((12 * dn).toInt(), (90 * dn).toInt())
+              }
+
+              private fun shown(id: String): Boolean {
+                  if (!Prefs.bool("enabled", true) || !Prefs.on(id)) return false
+                  if (Prefs.bool("editing", false)) return true
+                  val f = fg
+                  if (id != "zone" && id != "btn" && Prefs.bool("hide_on", false) && f != null && Prefs.strs("sel_hide").contains(f)) return false
+                  return true
+              }
+
+              private fun anyTick() = shown("clk") || shown("tim") || shown("net")
+
+              private fun place(e: Elem, touchable: Boolean) {
+                  val d = resources.displayMetrics
+                  val dn = d.density
+                  val s = size(e.id)
+                  val (w, h) = dims(e.id, s, dn)
+                  e.lp.width = w
+                  e.lp.height = h
+                  val vw = if (w > 0) w else maxOf(e.view.width, (s * dn * 4).toInt())
+                  val vh = if (h > 0) h else maxOf(e.view.height, (s * dn * 1.6f).toInt())
+                  val (dx, dy) = defaultPos(e.id, vw, vh, dn, d.widthPixels, d.heightPixels)
+                  val sfx = orient()
+                  e.lp.x = Prefs.int(e.id + "_x" + sfx, dx).coerceIn(0, maxOf(0, d.widthPixels - vw))
+                  e.lp.y = Prefs.int(e.id + "_y" + sfx, dy).coerceIn(0, maxOf(0, d.heightPixels - vh))
+                  e.lp.flags = FLAGS or (if (touchable) 0 else LP.FLAG_NOT_TOUCHABLE)
+                  try { wm?.updateViewLayout(e.view, e.lp) } catch (_: Exception) { }
+              }
+
+              private fun dragger(e: Elem): View.OnTouchListener {
+                  var lx = 0f
+                  var ly = 0f
+                  return View.OnTouchListener { _, ev ->
+                      when (ev.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> { lx = ev.rawX; ly = ev.rawY }
+                          MotionEvent.ACTION_MOVE -> {
+                              val d = resources.displayMetrics
+                              val vw = if (e.lp.width > 0) e.lp.width else maxOf(e.view.width, 1)
+                              val vh = if (e.lp.height > 0) e.lp.height else maxOf(e.view.height, 1)
+                              e.lp.x = (e.lp.x + (ev.rawX - lx)).toInt().coerceIn(0, maxOf(0, d.widthPixels - vw))
+                              e.lp.y = (e.lp.y + (ev.rawY - ly)).toInt().coerceIn(0, maxOf(0, d.heightPixels - vh))
+                              lx = ev.rawX
+                              ly = ev.rawY
+                              try { wm?.updateViewLayout(e.view, e.lp) } catch (_: Exception) { }
+                          }
+                          MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                              Prefs.putInt(e.id + "_x" + orient(), e.lp.x)
+                              Prefs.putInt(e.id + "_y" + orient(), e.lp.y)
+                          }
+                      }
+                      true
+                  }
+              }
+
+              /** Relê todas as configurações. images=true também recarrega as imagens do usuário. */
+              fun refresh(images: Boolean = false) {
+                  if (!ready) return
+                  val edit = Prefs.bool("editing", false)
+                  val dn = resources.displayMetrics.density
+                  detector.thresholdDeg = 340f - Prefs.int("z_sens", 5) * 10f
+                  detector.gapMs = Prefs.int("z_gap", 1200).toLong()
+                  detector.minStep = 6 * dn
+                  zoneV.editing = edit; btnV.editing = edit; batV.editing = edit; netV.editing = edit
+                  batV.showPct = Prefs.bool("bat_pct", true)
+                  clkV.textSize = size("clk").toFloat()
+                  timV.textSize = size("tim").toFloat()
+                  val tint = if (edit) Color.argb(110, 109, 74, 255) else Color.TRANSPARENT
+                  clkV.setBackgroundColor(tint)
+                  timV.setBackgroundColor(tint)
+                  if (images) {
+                      batV.bmp = loadBitmap(File(filesDir, "img_bat"))
+                      netV.bmps.clear()
+                      for ((st, id) in listOf(4 to "n4", 3 to "n3", 2 to "n2", 1 to "n1", 0 to "n0", -1 to "nx")) {
+                          val b = loadBitmap(File(filesDir, "img_$id"))
+                          if (b != null) netV.bmps[st] = b
+                      }
+                  }
+                  for (e in elems) {
+                      val vis = shown(e.id)
+                      e.view.visibility = if (vis) View.VISIBLE else View.GONE
+                      place(e, vis && (edit || e.id == "zone" || e.id == "btn"))
+                      e.view.setOnTouchListener(when {
+                          edit -> dragger(e)
+                          e.id == "zone" -> zoneTouch
+                          e.id == "btn" -> btnTouch
+                          else -> null
+                      })
+                  }
+                  if (!Prefs.bool("enabled", true) || edit) closeRing()
+                  updateTexts()
+                  updateNet()
+                  startTick()
+                  for (e in elems) e.view.invalidate()
+              }
+
+              private fun startTick() {
+                  if (tickRunning || !ready || !screenOn || !anyTick()) return
+                  tickRunning = true
+                  ui.post(tickRun)
+              }
+
+              // ---------------------------------------------------------------- textos e tempo
+              private fun day() = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
+
+              private fun flush() {
+                  val p = curPkg ?: return
+                  if (curStart < 0) return
+                  val now = SystemClock.uptimeMillis()
+                  val k = "d_" + day() + "_" + p
+                  Prefs.putLong(k, Prefs.long(k, 0L) + (now - curStart))
+                  curStart = now
+              }
+
+              private fun switchTo(p: String) {
+                  if (p == curPkg) return
+                  flush()
+                  curPkg = p
+                  curStart = SystemClock.uptimeMillis()
+                  sessStart = curStart
+              }
+
+              private fun fmt(ms: Long, long: Boolean): String {
+                  val s = ms / 1000
+                  val h = s / 3600
+                  val m = (s % 3600) / 60
+                  val sec = s % 60
+                  return if (long) {
+                      if (h > 0) "$h h $m min" else if (m > 0) "$m min $sec s" else "$sec s"
+                  } else {
+                      if (h > 0) String.format(Locale.US, "%d:%02d:%02d", h, m, sec) else String.format(Locale.US, "%d:%02d", m, sec)
+                  }
+              }
+
+              private fun updateTexts() {
+                  if (!ready) return
+                  if (shown("clk")) {
+                      val f = if (Prefs.bool("clk_24", true)) "HH:mm" else "h:mm a"
+                      clkV.text = SimpleDateFormat(f, Locale.getDefault()).format(Date())
+                  }
+                  if (shown("tim")) {
+                      val p = curPkg
+                      if (p != null && curStart >= 0) {
+                          val now = SystemClock.uptimeMillis()
+                          val long = Prefs.bool("tim_long", false)
+                          val sb = StringBuilder(fmt(now - sessStart, long))
+                          if (Prefs.bool("tim_day", false)) {
+                              val tot = Prefs.long("d_" + day() + "_" + p, 0L) + (now - curStart)
+                              sb.append("  ·  hoje ").append(fmt(tot, long))
+                          }
+                          timV.text = sb.toString()
+                      } else {
+                          timV.text = "0:00"
+                      }
+                  }
+              }
+
+              // ---------------------------------------------------------------- internet
+              @Suppress("DEPRECATION")
+              private fun wifiLevel(): Int = try {
+                  val w = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+                  WifiManager.calculateSignalLevel(w.connectionInfo.rssi, 5)
+              } catch (_: Exception) { 3 }
+
+              private fun cellLevel(): Int = try {
+                  val tm = getSystemService(TELEPHONY_SERVICE) as TelephonyManager
+                  tm.signalStrength?.level ?: 3
+              } catch (_: Exception) { 3 }
+
+              /** 4..0 = pontos de sinal; -1 = sem conexão de verdade (não validada). */
+              private fun netState(): Int {
+                  val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+                  val n = cm.activeNetwork ?: return -1
+                  val c = cm.getNetworkCapabilities(n) ?: return -1
+                  if (!c.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) ||
+                      !c.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) return -1
+                  val wifi = c.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+                  val cell = c.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
+                  val src = Prefs.int("net_src", 0)
+                  if (src == 1 && !wifi) return -1
+                  if (src == 2 && !cell) return -1
+                  return if (wifi) wifiLevel() else if (cell) cellLevel() else 4
+              }
+
+              private fun updateNet() {
+                  if (!ready || !shown("net")) return
+                  netV.state = try { netState() } catch (_: Exception) { -1 }
+                  netV.invalidate()
+              }
+
+              // ---------------------------------------------------------------- painéis circulares
+              private fun appLabel(pkg: String): String = try {
+                  packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
+              } catch (_: Exception) { pkg }
+
+              private fun notifItems(gone: Set<String>): List<RingView.Item> {
+                  val ns = NotifService.instance ?: return emptyList()
+                  if (!Prefs.bool("n_read", true)) return emptyList()
+                  val only = Prefs.bool("n_only", false)
+                  val allow = Prefs.strs("sel_notif")
+                  val mode = Prefs.int("n_priv", 0)
+                  val groups = ns.active()
+                      .filter { !it.isOngoing && it.packageName != packageName && !gone.contains(it.packageName) }
+                      .filter { !only || allow.contains(it.packageName) }
+                      .groupBy { it.packageName }
+                  return groups.entries.sortedByDescending { en -> en.value.maxOf { it.postTime } }.map { en ->
+                      val last = en.value.maxByOrNull { it.postTime }!!
+                      val ex = last.notification.extras
+                      val t = ex.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
+                      val b = ex.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: ""
+                      val txt = when (mode) {
+                          0 -> (t + "\n" + b).trim()
+                          1 -> "Conteúdo oculto"
+                          else -> null
+                      }
+                      RingView.Item(en.key, appLabel(en.key), en.key, en.value.size, txt)
+                  }
+              }
+
+              private fun recentUsage(): Map<String, Long> = try {
+                  val um = getSystemService(USAGE_STATS_SERVICE) as UsageStatsManager
+                  val now = System.currentTimeMillis()
+                  um.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, now - 7 * 86400000L, now).associate { it.packageName to it.lastTimeUsed }
+              } catch (_: Exception) { emptyMap() }
+
+              private fun appItems(): List<RingView.Item> {
+                  val pm = packageManager
+                  val hidden = Prefs.strs("ring_hidden")
+                  val used = recentUsage()
+                  val seen = HashSet<String>()
+                  val out = ArrayList<RingView.Item>()
+                  val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  for (ri in pm.queryIntentActivities(intent, 0)) {
+                      val p = ri.activityInfo.packageName
+                      if (p == packageName || hidden.contains(p) || !seen.add(p)) continue
+                      out.add(RingView.Item(p, ri.loadLabel(pm).toString(), p, 0, null))
+                  }
+                  return out.sortedWith(compareByDescending<RingView.Item> { used[it.pkg] ?: 0L }.thenBy { it.label.lowercase() })
+              }
+
+              private fun launch(pkg: String) {
+                  try {
+                      val i = packageManager.getLaunchIntentForPackage(pkg) ?: return
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+                      startActivity(i)
+                  } catch (_: Exception) { }
+              }
+
+              private fun openNotif(pkg: String) {
+                  val ns = NotifService.instance
+                  val sbn = ns?.active()?.filter { it.packageName == pkg }?.maxByOrNull { it.postTime }
+                  val pi = sbn?.notification?.contentIntent
+                  if (ns != null && sbn != null && pi != null) {
+                      try {
+                          pi.send()
+                          if ((sbn.notification.flags and Notification.FLAG_AUTO_CANCEL) != 0) ns.cancelNotification(sbn.key)
+                          return
+                      } catch (_: Exception) { }
+                  }
+                  launch(pkg)
+              }
+
+              private fun dismissNotif(pkg: String) {
+                  val ns = NotifService.instance ?: return
+                  ns.active().filter { it.packageName == pkg }.forEach { ns.cancelNotification(it.key) }
+              }
+
+              /** mode 0 = notificações (centro na câmera); mode 1 = seletor de apps (centro no botão). */
+              fun openRing(mode: Int) {
+                  if (!ready || !Prefs.bool("enabled", true) || Prefs.bool("editing", false)) return
+                  closeRing()
+                  val dn = resources.displayMetrics.density
+                  val e = elem(if (mode == 0) "zone" else "btn")
+                  val rv = RingView(this)
+                  rv.cx = (e.lp.x + e.lp.width / 2).toFloat()
+                  rv.cy = (e.lp.y + e.lp.height / 2).toFloat()
+                  rv.radius = Prefs.int(if (mode == 0) "n_radius" else "a_radius", if (mode == 0) 140 else 130) * dn
+                  rv.dimAlpha = Prefs.int("dim", 20) * 255 / 100
+                  rv.perPage = Prefs.int(if (mode == 0) "n_per" else "a_per", if (mode == 0) 8 else 10)
+                  rv.dropCenter = mode == 1
+                  rv.emptyMsg = when {
+                      mode == 1 -> "Nenhum app"
+                      NotifService.instance == null -> "Autorize o acesso a notificações no NOTCH CIRCLE"
+                      !Prefs.bool("n_read", true) -> "Leitura de notificações desativada"
+                      else -> "Sem notificações"
+                  }
+                  val gone = HashSet<String>()
+                  fun reload() {
+                      rv.items = if (mode == 0) notifItems(gone) else appItems()
+                      rv.invalidate()
+                  }
+                  rv.onClose = { closeRing() }
+                  rv.onTap = { it0 ->
+                      if (mode == 0) openNotif(it0.pkg) else launch(it0.pkg)
+                      closeRing()
+                  }
+                  rv.onDrop = { it0 ->
+                      if (mode == 0) {
+                          gone.add(it0.pkg)
+                          dismissNotif(it0.pkg)
+                      } else {
+                          Prefs.putStrs("ring_hidden", Prefs.strs("ring_hidden") + it0.pkg)
+                      }
+                      reload()
+                  }
+                  reload()
+                  val lp = LP(LP.MATCH_PARENT, LP.MATCH_PARENT, LP.TYPE_ACCESSIBILITY_OVERLAY, FLAGS, PixelFormat.TRANSLUCENT)
+                  if (Build.VERSION.SDK_INT >= 28) lp.layoutInDisplayCutoutMode = LP.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                  try {
+                      wm?.addView(rv, lp)
+                      panel = rv
+                  } catch (_: Exception) { }
+              }
+
+              fun closeRing() {
+                  val p = panel ?: return
+                  try { wm?.removeView(p) } catch (_: Exception) { }
+                  panel = null
+              }
+
+              // ---------------------------------------------------------------- eventos
+              /** O próprio app avisa que está na frente (o serviço ignora os eventos do próprio pacote). */
+              fun setForeground(pkg: String) {
+                  fg = pkg
+                  switchTo(pkg)
+                  refresh()
+              }
+
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {
+                  if (e == null || e.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+                  val p = e.packageName?.toString() ?: return
+                  if (p in ignore || p == fg) return
+                  fg = p
+                  switchTo(p)
+                  closeRing()
+                  refresh()
+              }
+
+              override fun onConfigurationChanged(newConfig: Configuration) {
+                  super.onConfigurationChanged(newConfig)
+                  ui.post { closeRing(); refresh() }
+              }
+
+              override fun onInterrupt() {
+                  closeRing()
+              }
+
+              override fun onDestroy() {
+                  instance = null
+                  flush()
+                  ui.removeCallbacksAndMessages(null)
+                  closeRing()
+                  try { unregisterReceiver(batRcv) } catch (_: Exception) { }
+                  try { unregisterReceiver(scrRcv) } catch (_: Exception) { }
+                  try { (getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager).unregisterNetworkCallback(netCb) } catch (_: Exception) { }
+                  if (ready) for (e in elems) try { wm?.removeView(e.view) } catch (_: Exception) { }
+                  super.onDestroy()
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/notchcircle/NotifService.kt <<'EOF'
+          package com.notchcircle
+
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+
+          /** Lê as notificações (só funciona depois que o usuário autoriza em "Acesso a notificações"). */
+          class NotifService : NotificationListenerService() {
+              companion object {
+                  var instance: NotifService? = null
+              }
+
+              override fun onListenerConnected() {
+                  instance = this
+              }
+
+              override fun onListenerDisconnected() {
+                  instance = null
+              }
+
+              fun active(): List<StatusBarNotification> = try {
+                  activeNotifications.toList()
+              } catch (_: Exception) {
+                  emptyList()
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/notchcircle/Prefs.kt <<'EOF'
+          package com.notchcircle
+
+          import android.content.Context
+          import android.content.SharedPreferences
+
+          /** Todas as configurações ficam aqui, salvas no aparelho. */
+          object Prefs {
+              private lateinit var sp: SharedPreferences
+
+              fun init(c: Context) {
+                  if (!::sp.isInitialized) sp = c.applicationContext.getSharedPreferences("notch", Context.MODE_PRIVATE)
+              }
+
+              fun bool(k: String, d: Boolean): Boolean = sp.getBoolean(k, d)
+              fun putBool(k: String, v: Boolean) = sp.edit().putBoolean(k, v).apply()
+              fun int(k: String, d: Int): Int = sp.getInt(k, d)
+              fun putInt(k: String, v: Int) = sp.edit().putInt(k, v).apply()
+              fun long(k: String, d: Long): Long = sp.getLong(k, d)
+              fun putLong(k: String, v: Long) = sp.edit().putLong(k, v).apply()
+              fun strs(k: String): Set<String> = sp.getStringSet(k, emptySet()) ?: emptySet()
+              fun putStrs(k: String, v: Set<String>) = sp.edit().putStringSet(k, HashSet(v)).apply()
+
+              /** Cada elemento (zone, btn, bat, clk, tim, net) liga e desliga sozinho. */
+              fun on(id: String): Boolean = bool(id + "_on", id == "zone")
+
+              fun resetPositions() {
+                  val e = sp.edit()
+                  val rx = Regex("^(zone|btn|bat|clk|tim|net)_[xy]_[lp]$")
+                  for (k in sp.all.keys) if (rx.matches(k)) e.remove(k)
+                  e.apply()
+              }
+
+              fun resetAll() = sp.edit().clear().apply()
+          }
+          EOF
+          cat > app/src/main/java/com/notchcircle/Views.kt <<'EOF'
+          package com.notchcircle
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.DashPathEffect
+          import android.graphics.LinearGradient
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.PointF
+          import android.graphics.RectF
+          import android.graphics.Shader
+          import android.graphics.Typeface
+          import android.graphics.drawable.Drawable
+          import android.os.SystemClock
+          import android.text.StaticLayout
+          import android.text.TextPaint
+          import android.text.TextUtils
+          import android.view.MotionEvent
+          import android.view.View
+          import java.io.File
+          import kotlin.math.PI
+          import kotlin.math.abs
+          import kotlin.math.atan2
+          import kotlin.math.cos
+          import kotlin.math.hypot
+          import kotlin.math.sin
+
+          /** Lê uma imagem (PNG, JPG ou WEBP) do disco, reduzindo se for enorme. */
+          fun loadBitmap(f: File): Bitmap? {
+              if (!f.exists()) return null
+              return try {
+                  val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                  BitmapFactory.decodeFile(f.path, o)
+                  var s = 1
+                  while (o.outWidth / s > 1024 || o.outHeight / s > 1024) s *= 2
+                  BitmapFactory.decodeFile(f.path, BitmapFactory.Options().apply { inSampleSize = s })
+              } catch (e: Exception) {
+                  null
+              }
+          }
+
+          fun drawFit(c: Canvas, b: Bitmap, w: Float, h: Float, p: Paint) {
+              val r = minOf(w / b.width, h / b.height)
+              val dw = b.width * r
+              val dh = b.height * r
+              c.drawBitmap(b, null, RectF((w - dw) / 2, (h - dh) / 2, (w + dw) / 2, (h + dh) / 2), p)
+          }
+
+          private fun editBox(c: Canvas, w: Float, h: Float, p: Paint) {
+              p.style = Paint.Style.STROKE
+              p.strokeWidth = 4f
+              p.color = Color.parseColor("#FFD400")
+              p.pathEffect = DashPathEffect(floatArrayOf(14f, 10f), 0f)
+              c.drawRect(2f, 2f, w - 2f, h - 2f, p)
+              p.pathEffect = null
+          }
+
+          /** Bateria: ícone padrão desenhado, ou a imagem do usuário, mais a porcentagem. */
+          class BatteryView(c: Context) : View(c) {
+              var level = 100
+              var charging = false
+              var showPct = true
+              var bmp: Bitmap? = null
+              var editing = false
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+
+              override fun onDraw(cv: Canvas) {
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  val iw = h * 1.3f
+                  val b = bmp
+                  if (b != null) {
+                      drawFit(cv, b, iw, h, p)
+                  } else {
+                      val col = if (charging) Color.parseColor("#35C7E8") else if (level <= 20) Color.parseColor("#E53935") else Color.parseColor("#3FD16A")
+                      val body = RectF(h * 0.06f, h * 0.2f, iw - h * 0.16f, h * 0.8f)
+                      p.style = Paint.Style.STROKE
+                      p.strokeWidth = h * 0.07f
+                      p.color = Color.WHITE
+                      cv.drawRoundRect(body, h * 0.1f, h * 0.1f, p)
+                      p.style = Paint.Style.FILL
+                      cv.drawRect(iw - h * 0.16f, h * 0.38f, iw - h * 0.06f, h * 0.62f, p)
+                      p.color = col
+                      val fw = (body.width() - h * 0.14f) * level.coerceIn(0, 100) / 100f
+                      cv.drawRect(body.left + h * 0.07f, body.top + h * 0.07f, body.left + h * 0.07f + fw, body.bottom - h * 0.07f, p)
+                  }
+                  if (showPct) {
+                      val t = level.toString() + "%"
+                      p.textAlign = Paint.Align.LEFT
+                      p.textSize = h * 0.52f
+                      p.typeface = Typeface.DEFAULT_BOLD
+                      val y = h * 0.5f + p.textSize * 0.35f
+                      p.style = Paint.Style.STROKE
+                      p.strokeWidth = h * 0.12f
+                      p.color = Color.BLACK
+                      cv.drawText(t, iw + h * 0.1f, y, p)
+                      p.style = Paint.Style.FILL
+                      p.color = Color.WHITE
+                      cv.drawText(t, iw + h * 0.1f, y, p)
+                  }
+                  if (editing) editBox(cv, w, h, p)
+              }
+          }
+
+          /** Desenhos padrão do indicador de internet: formiga com folha, semente, pedra, metal e exclamação. */
+          fun drawNetDefault(c: Canvas, st: Int, s: Float) {
+              val u = s / 100f
+              val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              when {
+                  st >= 3 -> {
+                      val ls = if (st == 4) 1f else 0.7f
+                      p.style = Paint.Style.FILL
+                      p.color = Color.parseColor("#3FAE49")
+                      c.save()
+                      c.rotate(-18f, 45 * u, 42 * u)
+                      c.drawOval(RectF(45 * u - 26 * u * ls, 42 * u - 12 * u * ls, 45 * u + 26 * u * ls, 42 * u + 12 * u * ls), p)
+                      p.style = Paint.Style.STROKE
+                      p.strokeWidth = 1.6f * u
+                      p.color = Color.parseColor("#2A7D32")
+                      c.drawLine(45 * u - 24 * u * ls, 42 * u, 45 * u + 24 * u * ls, 42 * u, p)
+                      c.restore()
+                      p.style = Paint.Style.FILL
+                      p.color = Color.parseColor("#4A2C17")
+                      c.drawCircle(30 * u, 66 * u, 14 * u, p)
+                      c.drawCircle(52 * u, 66 * u, 8 * u, p)
+                      c.drawCircle(68 * u, 64 * u, 9 * u, p)
+                      p.style = Paint.Style.STROKE
+                      p.strokeWidth = 3 * u
+                      p.strokeCap = Paint.Cap.ROUND
+                      c.drawLine(52 * u, 70 * u, 42 * u, 90 * u, p)
+                      c.drawLine(52 * u, 72 * u, 54 * u, 92 * u, p)
+                      c.drawLine(52 * u, 70 * u, 64 * u, 90 * u, p)
+                      c.drawLine(72 * u, 58 * u, 84 * u, 46 * u, p)
+                      c.drawLine(76 * u, 60 * u, 90 * u, 54 * u, p)
+                  }
+                  st == 2 -> {
+                      p.style = Paint.Style.FILL
+                      p.color = Color.parseColor("#8A5A2B")
+                      c.save()
+                      c.rotate(28f, 50 * u, 52 * u)
+                      c.drawOval(RectF(28 * u, 36 * u, 72 * u, 68 * u), p)
+                      p.style = Paint.Style.STROKE
+                      p.strokeWidth = 2 * u
+                      p.color = Color.parseColor("#C99A63")
+                      c.drawLine(32 * u, 52 * u, 68 * u, 52 * u, p)
+                      c.restore()
+                  }
+                  st == 1 -> {
+                      val path = Path()
+                      path.moveTo(18 * u, 72 * u); path.lineTo(26 * u, 46 * u); path.lineTo(50 * u, 32 * u)
+                      path.lineTo(76 * u, 42 * u); path.lineTo(84 * u, 68 * u); path.lineTo(60 * u, 78 * u); path.close()
+                      p.style = Paint.Style.FILL
+                      p.color = Color.parseColor("#8D8D92")
+                      c.drawPath(path, p)
+                      p.style = Paint.Style.STROKE
+                      p.strokeWidth = 2 * u
+                      p.color = Color.parseColor("#5C5C61")
+                      c.drawLine(40 * u, 40 * u, 52 * u, 62 * u, p)
+                      c.drawLine(52 * u, 62 * u, 70 * u, 58 * u, p)
+                  }
+                  st == 0 -> {
+                      p.style = Paint.Style.FILL
+                      p.shader = LinearGradient(0f, 40 * u, 0f, 64 * u,
+                          intArrayOf(Color.parseColor("#F5F5F5"), Color.parseColor("#8E8E93"), Color.parseColor("#D8D8DC")),
+                          null, Shader.TileMode.CLAMP)
+                      c.drawRoundRect(RectF(14 * u, 40 * u, 86 * u, 64 * u), 6 * u, 6 * u, p)
+                      p.shader = null
+                  }
+                  else -> {
+                      p.style = Paint.Style.FILL
+                      p.color = Color.parseColor("#E53935")
+                      c.drawCircle(50 * u, 50 * u, 40 * u, p)
+                      p.color = Color.WHITE
+                      p.textAlign = Paint.Align.CENTER
+                      p.typeface = Typeface.DEFAULT_BOLD
+                      p.textSize = 62 * u
+                      c.drawText("!", 50 * u, 50 * u + 22 * u, p)
+                  }
+              }
+          }
+
+          /** Indicador de internet. Estados: 4..0 = pontos de sinal, -1 = sem conexão. */
+          class NetView(c: Context) : View(c) {
+              var state = -1
+              var editing = false
+              val bmps = HashMap<Int, Bitmap>()
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+
+              override fun onDraw(cv: Canvas) {
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  val b = bmps[state]
+                  if (b != null) drawFit(cv, b, w, h, p) else drawNetDefault(cv, state, minOf(w, h))
+                  if (editing) editBox(cv, w, h, p)
+              }
+          }
+
+          /** Área perto da câmera onde os dois círculos são desenhados (só aparece no modo de edição). */
+          class ZoneView(c: Context) : View(c) {
+              var editing = false
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+
+              override fun onDraw(cv: Canvas) {
+                  if (!editing) return
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  p.style = Paint.Style.FILL
+                  p.color = Color.argb(50, 109, 74, 255)
+                  cv.drawCircle(w / 2, h / 2, minOf(w, h) / 2, p)
+                  p.style = Paint.Style.STROKE
+                  p.strokeWidth = 4f
+                  p.color = Color.parseColor("#FFD400")
+                  p.pathEffect = DashPathEffect(floatArrayOf(14f, 10f), 0f)
+                  cv.drawCircle(w / 2, h / 2, minOf(w, h) / 2 - 2f, p)
+                  p.pathEffect = null
+                  p.style = Paint.Style.FILL
+                  p.color = Color.WHITE
+                  p.textAlign = Paint.Align.CENTER
+                  p.textSize = minOf(w, h) * 0.14f
+                  cv.drawText("círculos aqui", w / 2, h / 2 + p.textSize * 0.35f, p)
+              }
+          }
+
+          /** Botão do seletor de apps: segure o tempo configurado pra abrir o círculo. */
+          class BtnView(c: Context) : View(c) {
+              var editing = false
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+
+              override fun onDraw(cv: Canvas) {
+                  val w = width.toFloat()
+                  val r = w / 2
+                  p.style = Paint.Style.FILL
+                  p.color = Color.argb(170, 109, 74, 255)
+                  cv.drawCircle(r, r, r - 3f, p)
+                  p.style = Paint.Style.STROKE
+                  p.strokeWidth = w * 0.07f
+                  p.color = Color.WHITE
+                  cv.drawCircle(r, r, r * 0.55f, p)
+                  if (editing) editBox(cv, w, w, p)
+              }
+          }
+
+          /** Detecta dois círculos rápidos em sequência. */
+          class CircleDetector(private val onTwo: () -> Unit) {
+              var thresholdDeg = 290f
+              var gapMs = 1200L
+              var minStep = 12f
+              private var lastX = 0f
+              private var lastY = 0f
+              private var lastDir = Float.NaN
+              private var ang = 0f
+              private var circles = 0
+              private var firstT = 0L
+
+              fun onTouch(e: MotionEvent) {
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> {
+                          lastX = e.x; lastY = e.y; lastDir = Float.NaN; ang = 0f
+                      }
+                      MotionEvent.ACTION_MOVE -> {
+                          val dx = e.x - lastX
+                          val dy = e.y - lastY
+                          if (hypot(dx, dy) < minStep) return
+                          val dir = atan2(dy, dx)
+                          if (!lastDir.isNaN()) {
+                              var d = dir - lastDir
+                              while (d > PI) d -= (2 * PI).toFloat()
+                              while (d < -PI) d += (2 * PI).toFloat()
+                              ang += d
+                          }
+                          lastDir = dir; lastX = e.x; lastY = e.y
+                          if (abs(ang) >= Math.toRadians(thresholdDeg.toDouble()).toFloat()) {
+                              ang = 0f
+                              done()
+                          }
+                      }
+                      MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> lastDir = Float.NaN
+                  }
+              }
+
+              private fun done() {
+                  val now = SystemClock.uptimeMillis()
+                  if (circles == 1 && now - firstT <= gapMs) {
+                      circles = 0
+                      onTwo()
+                  } else {
+                      circles = 1
+                      firstT = now
+                  }
+              }
+          }
+
+          /** O círculo de ícones (usado pelas notificações e pelo seletor de apps). */
+          class RingView(c: Context) : View(c) {
+              class Item(val key: String, val label: String, val pkg: String, val badge: Int, val text: String?)
+
+              var items: List<Item> = emptyList()
+              var cx = 0f
+              var cy = 0f
+              var radius = 0f
+              var perPage = 8
+              var dimAlpha = 51
+              var dropCenter = false
+              var emptyMsg = "Nada por aqui"
+              var onTap: (Item) -> Unit = {}
+              var onDrop: (Item) -> Unit = {}
+              var onClose: () -> Unit = {}
+
+              private val dn = resources.displayMetrics.density
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val tp = TextPaint(Paint.ANTI_ALIAS_FLAG)
+              private val icons = HashMap<String, Drawable?>()
+              private var page = 0
+              private var touchItem: Item? = null
+              private var sx = 0f
+              private var sy = 0f
+              private var fx = 0f
+              private var fy = 0f
+              private var moved = false
+              private var preview: Item? = null
+              private val longRun = Runnable {
+                  val t = touchItem
+                  if (!moved && t != null && t.text != null) {
+                      preview = t
+                      invalidate()
+                  }
+              }
+
+              private fun pages() = maxOf(1, (items.size + perPage - 1) / perPage)
+
+              private fun pageItems(): List<Item> {
+                  page = page.coerceIn(0, pages() - 1)
+                  return items.drop(page * perPage).take(perPage)
+              }
+
+              private fun icon(i: Item): Drawable? = icons.getOrPut(i.pkg) {
+                  try { context.packageManager.getApplicationIcon(i.pkg) } catch (_: Exception) { null }
+              }
+
+              /** Ângulo inicial e abertura do arco visível (180° se o centro está na borda da tela). */
+              private fun arc(): Pair<Float, Float> {
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  val need = radius * 1.25f
+                  val m = minOf(minOf(cy, h - cy), minOf(cx, w - cx))
+                  if (m >= need) return Pair(-90f, 360f)
+                  return when (m) {
+                      cy -> Pair(0f, 180f)
+                      h - cy -> Pair(180f, 180f)
+                      cx -> Pair(-90f, 180f)
+                      else -> Pair(90f, 180f)
+                  }
+              }
+
+              private fun iconSize(n: Int): Float {
+                  val sw = arc().second
+                  val len = radius * Math.toRadians(sw.toDouble()).toFloat()
+                  return minOf(radius * 0.36f, len / maxOf(n, 1) * 0.82f)
+              }
+
+              private fun positions(n: Int): List<PointF> {
+                  val (a0, sw) = arc()
+                  val full = sw >= 360f
+                  return List(n) { i ->
+                      val deg = if (full) a0 + sw * i / n else a0 + sw * (i + 0.5f) / n
+                      val a = Math.toRadians(deg.toDouble())
+                      PointF(cx + radius * cos(a).toFloat(), cy + radius * sin(a).toFloat())
+                  }
+              }
+
+              private fun navBase(): PointF {
+                  val (a0, sw) = arc()
+                  if (sw >= 360f) return PointF(cx, cy)
+                  val mid = Math.toRadians((a0 + sw / 2).toDouble())
+                  return PointF(cx + 0.42f * radius * cos(mid).toFloat(), cy + 0.42f * radius * sin(mid).toFloat())
+              }
+
+              private fun txt(c: Canvas, s: String, x: Float, y: Float, size: Float, align: Paint.Align, bold: Boolean) {
+                  tp.color = Color.WHITE
+                  tp.textSize = size
+                  tp.textAlign = align
+                  tp.isFakeBoldText = bold
+                  c.drawText(s, x, y, tp)
+              }
+
+              override fun onDraw(c: Canvas) {
+                  c.drawColor(Color.argb(dimAlpha, 0, 0, 0))
+                  val list = pageItems()
+                  val n = list.size
+                  val (a0, sw) = arc()
+                  p.style = Paint.Style.STROKE
+                  p.strokeWidth = 2 * dn
+                  p.color = Color.argb(70, 255, 255, 255)
+                  c.drawArc(RectF(cx - radius, cy - radius, cx + radius, cy + radius), a0, sw, false, p)
+                  val nb = navBase()
+                  if (n == 0) txt(c, emptyMsg, width / 2f, nb.y + 40 * dn, 16 * dn, Paint.Align.CENTER, true)
+                  val ic = iconSize(n)
+                  val pos = positions(n)
+                  for (i in 0 until n) {
+                      val it0 = list[i]
+                      val faded = touchItem === it0 && moved
+                      val x = pos[i].x
+                      val y = pos[i].y
+                      p.style = Paint.Style.FILL
+                      p.color = Color.argb(if (faded) 40 else 200, 30, 30, 40)
+                      c.drawCircle(x, y, ic * 0.62f, p)
+                      val d = icon(it0)
+                      if (d != null) {
+                          d.setBounds((x - ic / 2).toInt(), (y - ic / 2).toInt(), (x + ic / 2).toInt(), (y + ic / 2).toInt())
+                          d.alpha = if (faded) 90 else 255
+                          d.draw(c)
+                      }
+                      if (it0.badge > 1) {
+                          p.color = Color.parseColor("#E53935")
+                          c.drawCircle(x + ic * 0.38f, y - ic * 0.38f, ic * 0.24f, p)
+                          txt(c, it0.badge.toString(), x + ic * 0.38f, y - ic * 0.38f + ic * 0.09f, ic * 0.26f, Paint.Align.CENTER, true)
+                      }
+                  }
+                  if (dropCenter) {
+                      val s = ic * 0.45f
+                      p.style = Paint.Style.FILL
+                      p.color = Color.argb(140, 255, 80, 80)
+                      c.drawRoundRect(RectF(cx - s, cy - s, cx + s, cy + s), 8 * dn, 8 * dn, p)
+                      txt(c, "✕", cx, cy + s * 0.35f, s, Paint.Align.CENTER, true)
+                  }
+                  if (pages() > 1) {
+                      val ar = radius * 0.3f
+                      txt(c, "‹", nb.x - ar, nb.y + 10 * dn, 34 * dn, Paint.Align.CENTER, true)
+                      txt(c, "›", nb.x + ar, nb.y + 10 * dn, 34 * dn, Paint.Align.CENTER, true)
+                      txt(c, (page + 1).toString() + "/" + pages(), nb.x, nb.y + 6 * dn, 14 * dn, Paint.Align.CENTER, false)
+                  }
+                  val t = touchItem
+                  if (t != null && moved) {
+                      val d = icon(t)
+                      if (d != null) {
+                          val s = ic * 1.15f
+                          d.setBounds((fx - s / 2).toInt(), (fy - s / 2).toInt(), (fx + s / 2).toInt(), (fy + s / 2).toInt())
+                          d.alpha = 255
+                          d.draw(c)
+                      }
+                  }
+                  val pv = preview
+                  if (pv != null) {
+                      val body = pv.text ?: ""
+                      val w = width * 0.8f
+                      tp.textSize = 14 * dn
+                      tp.color = Color.WHITE
+                      tp.isFakeBoldText = false
+                      val lay = StaticLayout.Builder.obtain(body, 0, body.length, tp, (w - 24 * dn).toInt())
+                          .setMaxLines(4).setEllipsize(TextUtils.TruncateAt.END).build()
+                      val th = lay.height + 52 * dn
+                      val left = (width - w) / 2
+                      val top = minOf(height - th - 24 * dn, maxOf(cy + radius * 1.35f, 24 * dn))
+                      p.style = Paint.Style.FILL
+                      p.color = Color.argb(235, 28, 28, 34)
+                      c.drawRoundRect(RectF(left, top, left + w, top + th), 18 * dn, 18 * dn, p)
+                      txt(c, pv.label, left + 12 * dn, top + 26 * dn, 15 * dn, Paint.Align.LEFT, true)
+                      tp.textAlign = Paint.Align.LEFT
+                      tp.isFakeBoldText = false
+                      tp.textSize = 14 * dn
+                      c.save()
+                      c.translate(left + 12 * dn, top + 36 * dn)
+                      lay.draw(c)
+                      c.restore()
+                  }
+              }
+
+              private fun hit(x: Float, y: Float): Item? {
+                  val list = pageItems()
+                  val ic = iconSize(list.size)
+                  val pos = positions(list.size)
+                  for (i in list.indices) if (hypot(x - pos[i].x, y - pos[i].y) <= ic * 0.65f) return list[i]
+                  return null
+              }
+
+              private fun navHit(x: Float, y: Float): Boolean {
+                  if (pages() <= 1) return false
+                  val nb = navBase()
+                  val ar = radius * 0.3f
+                  val r = maxOf(radius * 0.18f, 28 * dn)
+                  if (hypot(x - (nb.x - ar), y - nb.y) <= r) { page = (page + pages() - 1) % pages(); return true }
+                  if (hypot(x - (nb.x + ar), y - nb.y) <= r) { page = (page + 1) % pages(); return true }
+                  return false
+              }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> {
+                          sx = e.x; sy = e.y; fx = e.x; fy = e.y; moved = false; preview = null
+                          touchItem = hit(e.x, e.y)
+                          if (touchItem != null) postDelayed(longRun, 450)
+                      }
+                      MotionEvent.ACTION_MOVE -> if (touchItem != null) {
+                          fx = e.x; fy = e.y
+                          if (hypot(e.x - sx, e.y - sy) > 14 * dn) {
+                              moved = true
+                              removeCallbacks(longRun)
+                              preview = null
+                          }
+                          invalidate()
+                      }
+                      MotionEvent.ACTION_UP -> {
+                          removeCallbacks(longRun)
+                          val t = touchItem
+                          if (t != null) {
+                              if (moved) {
+                                  val dist = hypot(e.x - cx, e.y - cy)
+                                  val drop = if (dropCenter) dist < iconSize(1) else dist > radius * 1.6f
+                                  if (drop) onDrop(t)
+                              } else if (preview == null) {
+                                  onTap(t)
+                              }
+                          } else if (!navHit(e.x, e.y)) {
+                              onClose()
+                          }
+                          touchItem = null; preview = null; moved = false
+                          invalidate()
+                      }
+                      MotionEvent.ACTION_CANCEL -> {
+                          removeCallbacks(longRun)
+                          touchItem = null; preview = null; moved = false
+                          invalidate()
+                      }
+                  }
+                  return true
+              }
+          }
+          EOF
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">NOTCH CIRCLE</string>
+              <string name="service_desc">Mostra painéis circulares e indicadores (bateria, relógio, tempo de uso, internet) por cima dos apps. Só vê qual app está aberto, não lê o conteúdo das telas.</string>
+          </resources>
+          EOF
+          cat > app/src/main/res/xml/accessibility_service_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault"
+              android:canRetrieveWindowContent="false"
+              android:notificationTimeout="0"
+              android:description="@string/service_desc" />
+          EOF
+
+      - name: Compilar
+        run: |
+          gradle assembleDebug --no-daemon --console=plain > build.log 2>&1 || {
+            echo "=== ERROS DE COMPILACAO (me mande um print disto) ==="
+            grep -E "^e: |What went wrong" -A3 build.log | head -80
+            exit 1
+          }
+          echo "Compilou sem erros."
+
+      - name: Guardar o APK como artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: notch-circle-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Publicar o APK em Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "notch-${{ github.run_number }}" app/build/outputs/apk/debug/app-debug.apk \
+            --title "NOTCH CIRCLE #${{ github.run_number }}" \
+            --notes "Baixe o app-debug.apk e instale no celular."
