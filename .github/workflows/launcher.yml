@@ -1,0 +1,2795 @@
+# HORIZON LAUNCHER (launcher Android horizontal). Coloque em .github/workflows/launcher.yml
+# Monta o projeto, compila na nuvem e publica o APK em "Releases" (e como artefato).
+name: Gerar APK do Horizon Launcher
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Criar o projeto Android
+        run: |
+          mkdir -p app app/src/main app/src/main/java/com/horizonlauncher app/src/main/res/values
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "HorizonLauncher"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g
+          kotlin.code.style=official
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.horizonlauncher"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.horizonlauncher"
+                  minSdk = 30
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" />
+              <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@android:drawable/ic_menu_compass"
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
+
+                  <activity
+                      android:name=".LauncherActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:stateNotNeeded="true"
+                      android:screenOrientation="sensorLandscape"
+                      android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.HOME" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <activity
+                      android:name=".SettingsActivity"
+                      android:exported="false"
+                      android:label="Configurações"
+                      android:screenOrientation="sensorLandscape"
+                      android:theme="@android:style/Theme.DeviceDefault" />
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/horizonlauncher/Data.kt <<'EOF'
+          package com.horizonlauncher
+
+          import android.app.usage.UsageStatsManager
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ApplicationInfo
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.Canvas
+          import android.graphics.Path
+          import android.graphics.RectF
+          import android.graphics.drawable.Drawable
+          import android.media.MediaMetadataRetriever
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
+
+          /** Um app ou jogo instalado. Os campos soltos são usados pelos ambientes (posição, estado, etc.). */
+          class AppItem(val pkg: String, val label: String, var game: Boolean, var hidden: Boolean, val icon: Bitmap) {
+              var x = 0f; var y = 0f; var r = 20f; var s = 1f; var a = 1f
+              var ang = 0f; var rad = 0f; var ring = 0; var ph = 0f; var sp = 0f
+              var vx = 0f; var vy = 0f; var wx = 0f; var wy = 0f; var tm = 0f
+              var st = 0; var act = 0; var floor = 0; var yF = 0f; var tfloor = 0
+              var energy = 1f; var sleeper = false; var lastUsed = 0L
+          }
+
+          /** Widget personalizado: gif, link, foto, vídeo ou som. Posição e largura são frações da tela. */
+          class Widget(val id: String, var type: String, var title: String, var data: String, var fx: Float, var fy: Float, var fw: Float) {
+              var bmp: Bitmap? = null
+              var anim: Drawable? = null
+              var playing = false
+              val rect = RectF()
+          }
+
+          object Store {
+              fun loadWidgets(): ArrayList<Widget> {
+                  val out = ArrayList<Widget>()
+                  try {
+                      val a = JSONArray(Prefs.str("widgets", "[]"))
+                      for (i in 0 until a.length()) {
+                          val o = a.getJSONObject(i)
+                          out.add(Widget(o.getString("id"), o.getString("type"), o.optString("title", ""), o.optString("data", ""),
+                              o.optDouble("fx", 0.3).toFloat(), o.optDouble("fy", 0.3).toFloat(), o.optDouble("fw", 0.22).toFloat()))
+                      }
+                  } catch (_: Exception) { }
+                  return out
+              }
+
+              fun saveWidgets(l: List<Widget>) {
+                  val a = JSONArray()
+                  for (w in l) {
+                      a.put(JSONObject().put("id", w.id).put("type", w.type).put("title", w.title).put("data", w.data)
+                          .put("fx", w.fx.toDouble()).put("fy", w.fy.toDouble()).put("fw", w.fw.toDouble()))
+                  }
+                  Prefs.putStr("widgets", a.toString())
+              }
+          }
+
+          fun loadBitmap(f: File): Bitmap? {
+              if (!f.exists()) return null
+              return try {
+                  val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                  BitmapFactory.decodeFile(f.path, o)
+                  var s = 1
+                  while (o.outWidth / s > 1280 || o.outHeight / s > 1280) s *= 2
+                  BitmapFactory.decodeFile(f.path, BitmapFactory.Options().apply { inSampleSize = s })
+              } catch (e: Exception) {
+                  null
+              }
+          }
+
+          fun videoPoster(f: File): Bitmap? {
+              val r = MediaMetadataRetriever()
+              return try {
+                  r.setDataSource(f.path)
+                  r.getFrameAtTime(0)
+              } catch (e: Exception) {
+                  null
+              } finally {
+                  try { r.release() } catch (_: Exception) { }
+              }
+          }
+
+          object AppRepo {
+              fun toBitmap(d: Drawable, s: Int): Bitmap {
+                  val b = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
+                  val c = Canvas(b)
+                  val p = Path()
+                  p.addCircle(s / 2f, s / 2f, s / 2f, Path.Direction.CW)
+                  c.clipPath(p)
+                  d.setBounds(0, 0, s, s)
+                  d.draw(c)
+                  return b
+              }
+
+              /** Uso real dos apps (precisa da permissão "acesso ao uso"; sem ela volta vazio). */
+              fun usage(ctx: Context): Pair<Map<String, Long>, Map<String, Long>> = try {
+                  val um = ctx.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+                  val now = System.currentTimeMillis()
+                  val st = um.queryUsageStats(UsageStatsManager.INTERVAL_MONTHLY, now - 30L * 86400000L, now)
+                  val tot = HashMap<String, Long>()
+                  val last = HashMap<String, Long>()
+                  for (s in st) {
+                      tot[s.packageName] = (tot[s.packageName] ?: 0L) + s.totalTimeInForeground
+                      last[s.packageName] = maxOf(last[s.packageName] ?: 0L, s.lastTimeUsed)
+                  }
+                  Pair(tot, last)
+              } catch (_: Exception) {
+                  Pair(emptyMap(), emptyMap())
+              }
+
+              fun loadAll(ctx: Context): List<AppItem> {
+                  val pm = ctx.packageManager
+                  val hidden = Prefs.strs("hidden")
+                  val fg = Prefs.strs("force_games")
+                  val fa = Prefs.strs("force_apps")
+                  val (_, last) = usage(ctx)
+                  val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  val seen = HashSet<String>()
+                  val out = ArrayList<AppItem>()
+                  for (ri in pm.queryIntentActivities(intent, 0)) {
+                      val p = ri.activityInfo.packageName
+                      if (p == ctx.packageName || !seen.add(p)) continue
+                      val game = if (fg.contains(p)) true else if (fa.contains(p)) false
+                      else ri.activityInfo.applicationInfo.category == ApplicationInfo.CATEGORY_GAME
+                      val it0 = AppItem(p, ri.loadLabel(pm).toString(), game, hidden.contains(p), toBitmap(ri.loadIcon(pm), 128))
+                      it0.lastUsed = maxOf(last[p] ?: 0L, Prefs.long("lo_" + p, 0L))
+                      out.add(it0)
+                  }
+                  return out
+              }
+
+              /** Separa em (jogos, apps) já ordenados e sem os ocultos. */
+              fun split(all: List<AppItem>, totals: Map<String, Long>): Pair<List<AppItem>, List<AppItem>> {
+                  val vis = all.filter { !it.hidden }
+                  return Pair(order(vis.filter { it.game }, "games", totals), order(vis.filter { !it.game }, "apps", totals))
+              }
+
+              private fun order(l: List<AppItem>, key: String, totals: Map<String, Long>): List<AppItem> = when (Prefs.int("order_mode", 0)) {
+                  1 -> l.sortedBy { it.label.lowercase() }
+                  2 -> l.sortedWith(compareByDescending<AppItem> { totals[it.pkg] ?: 0L }.thenBy { it.label.lowercase() })
+                  else -> {
+                      val ord = Prefs.str("order_" + key, "").split(",").filter { it.isNotEmpty() }
+                      val idx = ord.withIndex().associate { it.value to it.index }
+                      l.sortedWith(compareBy<AppItem> { idx[it.pkg] ?: Int.MAX_VALUE }.thenBy { it.label.lowercase() })
+                  }
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/horizonlauncher/LauncherActivity.kt <<'EOF'
+          package com.horizonlauncher
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.graphics.Color
+          import android.graphics.ImageDecoder
+          import android.graphics.drawable.GradientDrawable
+          import android.media.AudioManager
+          import android.media.MediaPlayer
+          import android.net.ConnectivityManager
+          import android.net.Network
+          import android.net.NetworkCapabilities
+          import android.net.Uri
+          import android.net.wifi.WifiManager
+          import android.os.BatteryManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.Settings
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.WindowInsets
+          import android.view.WindowInsetsController
+          import android.view.inputmethod.EditorInfo
+          import android.widget.EditText
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.MediaController
+          import android.widget.Toast
+          import android.widget.VideoView
+          import java.io.File
+          import kotlin.math.max
+
+          /** A tela inicial (HOME). Liga o SceneView ao Android: apps, bateria, Wi-Fi, som, widgets e wallpaper. */
+          class LauncherActivity : Activity() {
+              private lateinit var scene: SceneView
+              private lateinit var video: VideoBg
+              private lateinit var search: EditText
+              private var all: List<AppItem> = emptyList()
+              private var totals: Map<String, Long> = emptyMap()
+              private var widgets = ArrayList<Widget>()
+              private var widgetsSig = ""
+              private var wallVer = -1
+              private var lastMode = -1
+              private var player: MediaPlayer? = null
+              private var playingW: Widget? = null
+              private var batLevel = 100
+              private var charging = false
+              private val ui = Handler(Looper.getMainLooper())
+
+              private val batRcv = object : BroadcastReceiver() {
+                  override fun onReceive(c: Context?, i: Intent?) {
+                      if (i == null) return
+                      val lv = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+                      val sc = i.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
+                      val st = i.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+                      batLevel = if (lv >= 0) lv * 100 / max(sc, 1) else 100
+                      charging = st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL
+                      scene.batLevel = batLevel
+                      scene.charging = charging
+                      scene.invalidate()
+                      applyWallAnim()
+                  }
+              }
+              private val ringRcv = object : BroadcastReceiver() {
+                  override fun onReceive(c: Context?, i: Intent?) { syncRinger() }
+              }
+              private val pkgRcv = object : BroadcastReceiver() {
+                  override fun onReceive(c: Context?, i: Intent?) { loadItems() }
+              }
+              private val netCb = object : ConnectivityManager.NetworkCallback() {
+                  override fun onAvailable(network: Network) { runOnUiThread { updateWifi() } }
+                  override fun onLost(network: Network) { runOnUiThread { updateWifi() } }
+                  override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) { runOnUiThread { updateWifi() } }
+              }
+              private val wifiTick = object : Runnable {
+                  override fun run() {
+                      updateWifi()
+                      ui.postDelayed(this, 10000L)
+                  }
+              }
+
+              private fun dp(x: Int) = (x * resources.displayMetrics.density).toInt()
+
+              private fun reg(r: BroadcastReceiver, f: IntentFilter): Intent? =
+                  if (Build.VERSION.SDK_INT >= 33) registerReceiver(r, f, Context.RECEIVER_NOT_EXPORTED) else registerReceiver(r, f)
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  Prefs.init(this)
+                  window.setDecorFitsSystemWindows(false)
+                  val root = FrameLayout(this)
+                  root.setBackgroundColor(Color.BLACK)
+                  val mp = ViewGroup.LayoutParams.MATCH_PARENT
+                  video = VideoBg(this)
+                  video.visibility = View.GONE
+                  root.addView(video, FrameLayout.LayoutParams(mp, mp))
+                  scene = SceneView(this)
+                  root.addView(scene, FrameLayout.LayoutParams(mp, mp))
+                  search = makeSearch()
+                  val lp = FrameLayout.LayoutParams(dp(300), ViewGroup.LayoutParams.WRAP_CONTENT)
+                  lp.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                  lp.topMargin = dp(88)
+                  root.addView(search, lp)
+                  setContentView(root)
+
+                  scene.onOpen = { openApp(it) }
+                  scene.onMenu = { itemMenu(it) }
+                  scene.onHud = { hud(it) }
+                  scene.onWidget = { w, long -> widgetAction(w, long) }
+                  scene.onWidgetMoved = { saveWidgets() }
+
+                  reg(batRcv, IntentFilter(Intent.ACTION_BATTERY_CHANGED))?.let { batRcv.onReceive(this, it) }
+                  reg(ringRcv, IntentFilter(AudioManager.RINGER_MODE_CHANGED_ACTION))
+                  val pf = IntentFilter()
+                  pf.addAction(Intent.ACTION_PACKAGE_ADDED)
+                  pf.addAction(Intent.ACTION_PACKAGE_REMOVED)
+                  pf.addAction(Intent.ACTION_PACKAGE_REPLACED)
+                  pf.addDataScheme("package")
+                  reg(pkgRcv, pf)
+                  try { (getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager).registerDefaultNetworkCallback(netCb) } catch (_: Exception) { }
+                  loadItems()
+              }
+
+              private fun makeSearch(): EditText {
+                  val e = EditText(this)
+                  e.hint = "Pesquisar no Google"
+                  e.setHintTextColor(Color.argb(160, 255, 255, 255))
+                  e.setTextColor(Color.WHITE)
+                  e.setSingleLine()
+                  e.inputType = InputType.TYPE_CLASS_TEXT
+                  e.imeOptions = EditorInfo.IME_ACTION_SEARCH
+                  e.background = GradientDrawable().apply {
+                      cornerRadius = 200f
+                      setColor(Color.argb(150, 20, 20, 30))
+                      setStroke(2, Color.argb(120, 255, 255, 255))
+                  }
+                  e.setPadding(dp(18), dp(6), dp(18), dp(6))
+                  e.visibility = View.GONE
+                  e.setOnEditorActionListener { tv, actionId, _ ->
+                      if (actionId == EditorInfo.IME_ACTION_SEARCH) {
+                          val q = tv.text.toString().trim()
+                          if (q.isNotEmpty()) {
+                              openUrl("https://www.google.com/search?q=" + Uri.encode(q))
+                              tv.text = ""
+                              tv.clearFocus()
+                          }
+                          true
+                      } else false
+                  }
+                  return e
+              }
+
+              private fun immersive() {
+                  window.insetsController?.let { c ->
+                      c.hide(WindowInsets.Type.systemBars())
+                      c.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  immersive()
+                  applyPrefs()
+                  scene.start()
+                  syncRinger()
+                  updateWifi()
+                  ui.removeCallbacks(wifiTick)
+                  ui.postDelayed(wifiTick, 10000L)
+                  if (all.isNotEmpty()) applyItems()
+              }
+
+              override fun onPause() {
+                  scene.stop()
+                  ui.removeCallbacks(wifiTick)
+                  video.pausePlayback()
+                  stopSound()
+                  super.onPause()
+              }
+
+              override fun onDestroy() {
+                  try { unregisterReceiver(batRcv) } catch (_: Exception) { }
+                  try { unregisterReceiver(ringRcv) } catch (_: Exception) { }
+                  try { unregisterReceiver(pkgRcv) } catch (_: Exception) { }
+                  try { (getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager).unregisterNetworkCallback(netCb) } catch (_: Exception) { }
+                  stopSound()
+                  super.onDestroy()
+              }
+
+              @Suppress("DEPRECATION")
+              override fun onBackPressed() {
+                  // launcher: voltar não faz nada
+              }
+
+              override fun onNewIntent(intent: Intent?) {
+                  super.onNewIntent(intent)
+                  immersive()
+                  scene.invalidate()
+              }
+
+              // ---------------------------------------------------------------- dados
+              private fun loadItems() {
+                  Thread {
+                      val list = AppRepo.loadAll(this)
+                      val (tot, _) = AppRepo.usage(this)
+                      runOnUiThread { all = list; totals = tot; applyItems() }
+                  }.start()
+              }
+
+              private fun applyItems() {
+                  val (g, a) = AppRepo.split(all, totals)
+                  scene.setItems(g, a)
+              }
+
+              private fun animAllowed(): Boolean {
+                  if (Prefs.int("anim", 0) == 2) return false
+                  return when (Prefs.int("wall_anim", 0)) {
+                      0 -> true
+                      1 -> !(batLevel <= 20 && !charging)
+                      else -> false
+                  }
+              }
+
+              private fun applyWallAnim() {
+                  scene.setAnimPlaying(animAllowed())
+                  updateVideo()
+              }
+
+              private fun updateVideo() {
+                  val show = scene.mode == 5 && scene.wallVideo
+                  video.visibility = if (show) View.VISIBLE else View.GONE
+                  if (show && animAllowed()) video.resumePlayback() else video.pausePlayback()
+              }
+
+              private fun applyPrefs() {
+                  scene.anim = Prefs.int("anim", 0)
+                  scene.transOn = Prefs.bool("trans_on", true)
+                  scene.showArrows = Prefs.bool("arrows_on", true)
+                  scene.bgColor = Prefs.int("bg_color", Color.BLACK)
+                  val m = Prefs.int("mode", 0).coerceIn(0, 5)
+                  val first = lastMode == -1
+                  val ver = Prefs.int("wall_ver", 0)
+                  if (ver != wallVer) {
+                      if (!first && m == 5 && lastMode == 5) scene.beginTransition(5)
+                      wallVer = ver
+                      loadWallpaper()
+                  }
+                  scene.setMode(m, !first)
+                  lastMode = m
+                  search.visibility = if (Prefs.bool("search_on", false)) View.VISIBLE else View.GONE
+                  val sig = Prefs.str("widgets", "[]")
+                  if (sig != widgetsSig) {
+                      widgetsSig = sig
+                      val saved = Store.loadWidgets()
+                      for (w in saved) loadMedia(w)
+                      widgets = saved
+                      scene.widgets = widgets
+                  }
+                  applyWallAnim()
+                  scene.invalidate()
+              }
+
+              private fun loadWallpaper() {
+                  val f = File(filesDir, "wall.bin")
+                  val kind = Prefs.str("wall_kind", "")
+                  scene.wallDrawable = null
+                  scene.wallVideo = false
+                  video.clear()
+                  if (!f.exists()) return
+                  if (kind == "video") {
+                      scene.wallVideo = true
+                      video.play(f)
+                  } else if (kind == "image") {
+                      try {
+                          val d = ImageDecoder.decodeDrawable(ImageDecoder.createSource(f)) { dec, info, _ ->
+                              dec.setTargetSampleSize(max(1, max(info.size.width / 2400, info.size.height / 1400)))
+                          }
+                          scene.attachAnim(d)
+                          scene.wallDrawable = d
+                      } catch (_: Exception) { }
+                  }
+              }
+
+              private fun loadMedia(w: Widget) {
+                  val f = File(filesDir, "w_" + w.id)
+                  when (w.type) {
+                      "photo" -> w.bmp = loadBitmap(f)
+                      "video" -> w.bmp = videoPoster(f)
+                      "gif" -> try {
+                          val d = ImageDecoder.decodeDrawable(ImageDecoder.createSource(f))
+                          scene.attachAnim(d)
+                          w.anim = d
+                      } catch (_: Exception) { }
+                  }
+              }
+
+              private fun saveWidgets() {
+                  Store.saveWidgets(widgets)
+                  widgetsSig = Prefs.str("widgets", "[]")
+                  scene.invalidate()
+              }
+
+              // ---------------------------------------------------------------- Wi-Fi e som
+              @Suppress("DEPRECATION")
+              private fun updateWifi() {
+                  try {
+                      val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+                      val caps = cm.getNetworkCapabilities(cm.activeNetwork)
+                      if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                          val w = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+                          scene.wifi = WifiManager.calculateSignalLevel(w.connectionInfo.rssi, 4)
+                      } else {
+                          scene.wifi = -1
+                      }
+                  } catch (_: Exception) {
+                      scene.wifi = -1
+                  }
+                  scene.invalidate()
+              }
+
+              private fun syncRinger() {
+                  val am = getSystemService(AUDIO_SERVICE) as AudioManager
+                  scene.ringer = when (am.ringerMode) {
+                      AudioManager.RINGER_MODE_NORMAL -> 2
+                      AudioManager.RINGER_MODE_VIBRATE -> 1
+                      else -> 0
+                  }
+                  scene.invalidate()
+              }
+
+              private fun cycleSound() {
+                  val am = getSystemService(AUDIO_SERVICE) as AudioManager
+                  val next = when (am.ringerMode) {
+                      AudioManager.RINGER_MODE_NORMAL -> AudioManager.RINGER_MODE_VIBRATE
+                      AudioManager.RINGER_MODE_VIBRATE -> AudioManager.RINGER_MODE_SILENT
+                      else -> AudioManager.RINGER_MODE_NORMAL
+                  }
+                  try {
+                      am.ringerMode = next
+                  } catch (e: SecurityException) {
+                      Toast.makeText(this, "Para o modo silencioso, libere o acesso ao Não perturbe.", Toast.LENGTH_LONG).show()
+                      try { startActivity(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS)) } catch (_: Exception) { }
+                  }
+                  syncRinger()
+              }
+
+              // ---------------------------------------------------------------- ações
+              private fun openUrl(url: String) {
+                  try {
+                      startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                  } catch (_: Exception) {
+                      Toast.makeText(this, "Não consegui abrir o link.", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              private fun launchOr(pkg: String, fallback: () -> Unit) {
+                  val i = packageManager.getLaunchIntentForPackage(pkg)
+                  if (i != null) {
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      try { startActivity(i) } catch (_: Exception) { fallback() }
+                  } else {
+                      fallback()
+                  }
+              }
+
+              private fun hud(a: String) {
+                  when (a) {
+                      "google" -> launchOr("com.google.android.googlequicksearchbox") { openUrl("https://www.google.com") }
+                      "play" -> launchOr("com.android.vending") { openUrl("https://play.google.com/store") }
+                      "sound" -> cycleSound()
+                      "gear" -> startActivity(Intent(this, SettingsActivity::class.java))
+                      "prev", "next" -> {
+                          val m = (Prefs.int("mode", 0) + (if (a == "next") 1 else 5)) % 6
+                          Prefs.putInt("mode", m)
+                          lastMode = m
+                          scene.setMode(m, true)
+                          updateVideo()
+                      }
+                  }
+              }
+
+              private fun openApp(it0: AppItem) {
+                  val i = packageManager.getLaunchIntentForPackage(it0.pkg)
+                  if (i == null) { Toast.makeText(this, "Não consegui abrir " + it0.label, Toast.LENGTH_SHORT).show(); return }
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+                  val now = System.currentTimeMillis()
+                  Prefs.putLong("lo_" + it0.pkg, now)
+                  it0.lastUsed = now
+                  try { startActivity(i) } catch (_: Exception) { }
+              }
+
+              private fun itemMenu(it0: AppItem) {
+                  val opts = arrayOf("Esconder (sem desinstalar)", if (it0.game) "Mover para APP" else "Mover para JOGOS",
+                      "Mover para o início da lista", "Informações do app")
+                  AlertDialog.Builder(this).setTitle(it0.label).setItems(opts) { _, which ->
+                      when (which) {
+                          0 -> { Prefs.putStrs("hidden", Prefs.strs("hidden") + it0.pkg); it0.hidden = true; applyItems() }
+                          1 -> {
+                              val to = if (it0.game) "force_apps" else "force_games"
+                              val from = if (it0.game) "force_games" else "force_apps"
+                              Prefs.putStrs(to, Prefs.strs(to) + it0.pkg)
+                              Prefs.putStrs(from, Prefs.strs(from) - it0.pkg)
+                              it0.game = !it0.game
+                              applyItems()
+                          }
+                          2 -> {
+                              val k = if (it0.game) "games" else "apps"
+                              val cur = (if (it0.game) scene.games else scene.apps).map { x -> x.pkg }.filter { p -> p != it0.pkg }
+                              Prefs.putStr("order_$k", (listOf(it0.pkg) + cur).joinToString(","))
+                              Prefs.putInt("order_mode", 0)
+                              applyItems()
+                          }
+                          3 -> startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + it0.pkg)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                          else -> { }
+                      }
+                  }.show()
+              }
+
+              // ---------------------------------------------------------------- widgets
+              private fun widgetAction(w: Widget, long: Boolean) {
+                  if (long) { widgetMenu(w); return }
+                  when (w.type) {
+                      "link" -> openUrl(w.data)
+                      "sound" -> toggleSound(w)
+                      "video" -> playVideo(w)
+                      else -> { }
+                  }
+              }
+
+              private fun widgetMenu(w: Widget) {
+                  val opts = arrayOf("Mover", "Maior", "Menor", "Configurar", "Remover")
+                  AlertDialog.Builder(this).setTitle(w.title.ifEmpty { w.type }).setItems(opts) { _, which ->
+                      when (which) {
+                          0 -> { scene.moveWidget = w; Toast.makeText(this, "Arraste o widget para onde quiser.", Toast.LENGTH_SHORT).show() }
+                          1 -> { w.fw = minOf(0.9f, w.fw * 1.2f); saveWidgets() }
+                          2 -> { w.fw = maxOf(0.08f, w.fw / 1.2f); saveWidgets() }
+                          3 -> configWidget(w)
+                          4 -> {
+                              stopSound()
+                              File(filesDir, "w_" + w.id).delete()
+                              widgets.remove(w)
+                              saveWidgets()
+                          }
+                          else -> { }
+                      }
+                  }.show()
+              }
+
+              private fun configWidget(w: Widget) {
+                  val box = LinearLayout(this)
+                  box.orientation = LinearLayout.VERTICAL
+                  box.setPadding(dp(20), dp(8), dp(20), 0)
+                  val t = EditText(this); t.hint = "Título"; t.setText(w.title)
+                  box.addView(t)
+                  val u = EditText(this); u.hint = "Endereço do link"; u.setText(w.data)
+                  if (w.type == "link") box.addView(u)
+                  AlertDialog.Builder(this).setTitle("Configurar widget").setView(box)
+                      .setPositiveButton("Salvar") { _, _ ->
+                          w.title = t.text.toString().trim()
+                          if (w.type == "link") {
+                              val s = u.text.toString().trim()
+                              w.data = if (s.startsWith("http")) s else "https://$s"
+                          }
+                          saveWidgets()
+                      }.setNegativeButton("Cancelar", null).show()
+              }
+
+              private fun toggleSound(w: Widget) {
+                  if (playingW === w) { stopSound(); return }
+                  stopSound()
+                  try {
+                      val m = MediaPlayer()
+                      m.setDataSource(File(filesDir, "w_" + w.id).path)
+                      m.setOnCompletionListener { stopSound() }
+                      m.prepare()
+                      m.start()
+                      player = m; playingW = w; w.playing = true
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Não consegui tocar esse som.", Toast.LENGTH_SHORT).show()
+                  }
+                  scene.invalidate()
+              }
+
+              private fun stopSound() {
+                  try { player?.release() } catch (_: Exception) { }
+                  player = null
+                  playingW?.playing = false
+                  playingW = null
+                  if (::scene.isInitialized) scene.invalidate()
+              }
+
+              private fun playVideo(w: Widget) {
+                  val vv = VideoView(this)
+                  vv.setVideoPath(File(filesDir, "w_" + w.id).path)
+                  val mc = MediaController(this)
+                  mc.setAnchorView(vv)
+                  vv.setMediaController(mc)
+                  val d = AlertDialog.Builder(this).setView(vv).create()
+                  d.setOnDismissListener { vv.stopPlayback() }
+                  d.show()
+                  vv.start()
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/horizonlauncher/Modes.kt <<'EOF'
+          package com.horizonlauncher
+
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.LinearGradient
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.RadialGradient
+          import android.graphics.RectF
+          import android.graphics.Shader
+          import android.graphics.Typeface
+          import java.util.Calendar
+          import kotlin.math.abs
+          import kotlin.math.atan2
+          import kotlin.math.cos
+          import kotlin.math.floor
+          import kotlin.math.hypot
+          import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.sign
+          import kotlin.math.sin
+          import kotlin.math.sqrt
+
+          private const val PIF = 3.1415927f
+          private const val TAU = 6.2831855f
+
+          /** Cada ambiente do launcher: calcula posições, anima e desenha fundo + apps. */
+          abstract class Env(val v: SceneView) {
+              protected val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              protected val path = Path()
+              protected val rf = RectF()
+
+              abstract fun layout(w: Int, h: Int)
+              abstract fun update(dt: Float)
+              abstract fun draw(c: Canvas)
+              open fun busy(): Boolean = false
+              open fun tap(x: Float, y: Float): Boolean = false
+              open fun down(x: Float, y: Float) {}
+              open fun drag(dy: Float, dt: Float) {}
+              open fun up() {}
+
+              protected fun fillStars(s: FloatArray, seed: Long) {
+                  val r = java.util.Random(seed)
+                  for (i in s.indices) s[i] = r.nextFloat()
+              }
+
+              protected fun starField(c: Canvas, s: FloatArray, w: Float, h: Float, base: Int) {
+                  p.style = Paint.Style.FILL
+                  p.shader = null
+                  var i = 0
+                  while (i < s.size - 1) {
+                      val tw = 0.55f + 0.45f * sin(v.time * 1.2f + i)
+                      p.color = Color.argb((base * tw).toInt(), 255, 255, 255)
+                      c.drawCircle(s[i] * w, s[i + 1] * h, v.dn * (0.7f + (i % 3) * 0.3f), p)
+                      i += 2
+                  }
+              }
+
+              protected fun fit(s: String, maxW: Float): String {
+                  val n = p.breakText(s, true, maxW, null)
+                  return if (n >= s.length) s else s.substring(0, max(0, n - 1)) + "…"
+              }
+          }
+
+          // ====================================================================== SISTEMA e WALLPAPER
+          /** Duas colunas (JOGOS à esquerda, APP à direita) navegadas com o dedo pra cima e pra baixo. */
+          class ListEnv(v: SceneView, private val wall: Boolean) : Env(v) {
+              private val sc = floatArrayOf(0f, 0f)
+              private val vel = floatArrayOf(0f, 0f)
+              private var touchCol = -1
+              private var w = 0f
+              private var h = 0f
+
+              private fun listMode() = Prefs.int("present", 0) == 1
+              private fun items(col: Int) = if (col == 0) v.games else v.apps
+              private fun n(col: Int) = items(col).size
+              private fun gap() = v.iconPx * (if (listMode()) 1.28f else 1.08f)
+              private fun maxSc(col: Int) = max(0f, (n(col) - 1).toFloat())
+
+              override fun layout(w: Int, h: Int) {
+                  this.w = w.toFloat(); this.h = h.toFloat()
+                  for (i in 0..1) sc[i] = sc[i].coerceIn(0f, maxSc(i))
+                  place()
+              }
+
+              private fun place() {
+                  val ir = min(v.iconPx, h * 0.2f) / 2
+                  val li = listMode()
+                  val g = gap()
+                  val lim = if (li) 3.4f else 2.9f
+                  for (col in 0..1) {
+                      val cx = if (col == 0) w * 0.17f else w * 0.83f
+                      val cy = h * 0.56f
+                      for ((i, it0) in items(col).withIndex()) {
+                          val d = i - sc[col]
+                          val ad = abs(d)
+                          if (ad > lim) { it0.a = 0f; continue }
+                          if (li) { it0.s = 1f; it0.a = (1f - ad * 0.18f).coerceIn(0.1f, 1f) }
+                          else { it0.s = (1f - ad * 0.2f).coerceIn(0.42f, 1f); it0.a = (1f - ad * 0.27f).coerceIn(0.1f, 1f) }
+                          it0.x = cx; it0.y = cy + d * g; it0.r = ir
+                      }
+                  }
+              }
+
+              override fun busy(): Boolean = touchCol >= 0 || abs(vel[0]) > 0.02f || abs(vel[1]) > 0.02f ||
+                  abs(sc[0] - Math.round(sc[0])) > 0.004f || abs(sc[1] - Math.round(sc[1])) > 0.004f
+
+              override fun down(x: Float, y: Float) {
+                  touchCol = if (x < w * 0.34f) 0 else if (x > w * 0.66f) 1 else -1
+                  if (touchCol >= 0) vel[touchCol] = 0f
+              }
+
+              override fun drag(dy: Float, dt: Float) {
+                  val c = touchCol
+                  if (c < 0) return
+                  val g = gap()
+                  sc[c] = (sc[c] - dy / g).coerceIn(0f, maxSc(c))
+                  vel[c] = (-dy / g / max(dt, 0.008f) * 0.5f + vel[c] * 0.5f).coerceIn(-14f, 14f)
+              }
+
+              override fun up() { touchCol = -1 }
+
+              override fun update(dt: Float) {
+                  for (col in 0..1) {
+                      if (col == touchCol) continue
+                      if (abs(vel[col]) > 0.02f) {
+                          sc[col] += vel[col] * dt
+                          vel[col] *= max(0f, 1f - 3.5f * dt)
+                      } else {
+                          vel[col] = 0f
+                          sc[col] += (Math.round(sc[col]) - sc[col]) * min(1f, dt * 10f)
+                      }
+                      sc[col] = sc[col].coerceIn(0f, maxSc(col))
+                  }
+                  place()
+              }
+
+              private fun label(c: Canvas, it0: AppItem, align: Paint.Align, x: Float, y: Float) {
+                  p.style = Paint.Style.FILL
+                  p.shader = null
+                  p.color = Color.argb((it0.a * 255).toInt(), 255, 255, 255)
+                  p.textSize = h * 0.034f
+                  p.textAlign = align
+                  p.typeface = Typeface.DEFAULT
+                  p.setShadowLayer(6f, 0f, 0f, Color.BLACK)
+                  c.drawText(fit(it0.label, w * 0.2f), x, y, p)
+                  p.clearShadowLayer()
+              }
+
+              override fun draw(c: Canvas) {
+                  place()
+                  if (wall) { if (!v.wallVideo) v.drawWall(c) } else c.drawColor(v.bgColor)
+                  p.style = Paint.Style.FILL
+                  p.shader = null
+                  p.color = Color.argb(160, 255, 255, 255)
+                  p.textAlign = Paint.Align.CENTER
+                  p.textSize = h * 0.04f
+                  p.typeface = Typeface.DEFAULT_BOLD
+                  p.letterSpacing = 0.2f
+                  p.setShadowLayer(6f, 0f, 0f, Color.BLACK)
+                  c.drawText("JOGOS", w * 0.17f, h * 0.21f, p)
+                  c.drawText("APP", w * 0.83f, h * 0.21f, p)
+                  p.clearShadowLayer()
+                  p.letterSpacing = 0f
+                  val li = listMode()
+                  for (pass in 0..1) for (col in 0..1) for ((i, it0) in items(col).withIndex()) {
+                      val near = abs(i - sc[col]) < 0.6f
+                      if ((pass == 1) != near) continue
+                      v.drawItem(c, it0)
+                      if (it0.a < 0.3f) continue
+                      if (li) {
+                          if (col == 0) label(c, it0, Paint.Align.LEFT, it0.x + it0.r + 12 * v.dn, it0.y + h * 0.012f)
+                          else label(c, it0, Paint.Align.RIGHT, it0.x - it0.r - 12 * v.dn, it0.y + h * 0.012f)
+                      } else if (near) {
+                          label(c, it0, Paint.Align.CENTER, it0.x, it0.y + it0.r * it0.s + h * 0.045f)
+                      }
+                  }
+              }
+          }
+
+          // ====================================================================== TERRA
+          class TerraEnv(v: SceneView) : Env(v) {
+              private var w = 0f
+              private var h = 0f
+              private var cx = 0f
+              private var cy = 0f
+              private var re = 0f
+              private var ir = 0f
+              private val ringR = FloatArray(3)
+              private var impItem: AppItem? = null
+              private var impT = 0f
+              private var hitAng = 0f
+              private var dmg = 0f
+              private var oceanSh: Shader? = null
+              private var glowSh: Shader? = null
+              private val stars = FloatArray(160)
+              private val blobs = floatArrayOf(0.2f, 0.3f, 0.5f, 1.4f, -0.2f, 0.45f, 2.6f, 0.5f, 0.4f, 3.7f, -0.4f, 0.5f, 4.6f, 0.2f, 0.45f, 5.6f, -0.1f, 0.4f)
+              private val green = Color.parseColor("#3E9B4F")
+
+              init { fillStars(stars, 3L) }
+
+              private fun cap(r: Float): Int {
+                  var t = 0
+                  for (k in 0..2) t += max(1, floor(PIF * 0.76f * ringR[k] / (r * 2.24f)).toInt())
+                  return t
+              }
+
+              private fun assign(list: List<AppItem>, a0: Float, a1: Float) {
+                  var idx = 0
+                  for (k in 0..2) {
+                      if (idx >= list.size) break
+                      val cp = max(1, floor((a1 - a0) * ringR[k] / (ir * 2.24f)).toInt())
+                      val n = if (k == 2) list.size - idx else min(cp, list.size - idx)
+                      for (j in 0 until n) {
+                          val it0 = list[idx + j]
+                          it0.ring = k
+                          it0.ang = a0 + (a1 - a0) * (j + 0.5f) / n
+                          it0.rad = ringR[k]
+                          it0.ph = (idx + j) * 0.7f
+                      }
+                      idx += n
+                  }
+              }
+
+              override fun layout(w: Int, h: Int) {
+                  this.w = w.toFloat(); this.h = h.toFloat()
+                  cx = this.w / 2; cy = this.h * 0.5f
+                  val maxR = min(this.h * 0.30f, this.w * 0.27f)
+                  re = maxR * 0.36f
+                  val sp = (maxR - re) / 3f
+                  for (k in 0..2) ringR[k] = re + sp * (k + 1)
+                  ir = min(v.iconPx / 2f, sp * 0.44f)
+                  val need = max(v.games.size, v.apps.size)
+                  while (ir > 11f * v.dn && cap(ir) < need) ir *= 0.93f
+                  assign(v.games, PIF * 1.12f, PIF * 1.88f)
+                  assign(v.apps, PIF * 0.12f, PIF * 0.88f)
+                  oceanSh = RadialGradient(cx - re * 0.35f, cy - re * 0.35f, re * 1.5f,
+                      intArrayOf(0xFF6EC6FF.toInt(), 0xFF1E6FD0.toInt(), 0xFF0B2A6B.toInt()), floatArrayOf(0f, 0.55f, 1f), Shader.TileMode.CLAMP)
+                  glowSh = RadialGradient(cx, cy, re * 1.45f, intArrayOf(0x6638A9FF, 0x0038A9FF), floatArrayOf(0.7f, 1f), Shader.TileMode.CLAMP)
+              }
+
+              override fun busy(): Boolean = impItem != null
+
+              override fun tap(x: Float, y: Float): Boolean {
+                  if (impItem != null || hypot(x - cx, y - cy) > re * 1.15f) return false
+                  val pool = if (v.games.isNotEmpty()) v.games else v.apps
+                  if (pool.isEmpty()) return false
+                  impItem = pool[(Math.random() * pool.size).toInt().coerceIn(0, pool.size - 1)]
+                  impT = 0f
+                  val it0 = impItem!!
+                  hitAng = atan2(it0.y - cy, it0.x - cx)
+                  return true
+              }
+
+              private fun orbit(list: List<AppItem>) {
+                  val t = v.time
+                  for (it0 in list) {
+                      val a = it0.ang + sin(t * 0.5f + it0.ph) * 0.025f
+                      it0.x = cx + cos(a) * it0.rad; it0.y = cy + sin(a) * it0.rad
+                      it0.r = ir; it0.s = 1f; it0.a = 1f
+                  }
+              }
+
+              override fun update(dt: Float) {
+                  orbit(v.games); orbit(v.apps)
+                  val imp = impItem ?: return
+                  impT += dt
+                  val ox = imp.x
+                  val oy = imp.y
+                  val d = max(1f, hypot(ox - cx, oy - cy))
+                  val sx = cx + (ox - cx) / d * re
+                  val sy = cy + (oy - cy) / d * re
+                  if (impT < 0.7f) {
+                      val u = impT / 0.7f; val e = u * u
+                      imp.x = ox + (sx - ox) * e; imp.y = oy + (sy - oy) * e; imp.s = 1f - 0.45f * e
+                  } else if (impT < 1.0f) {
+                      imp.a = 0f
+                  } else if (impT < 1.8f) {
+                      val u = (impT - 1f) / 0.8f; val e = 1f - (1f - u) * (1f - u)
+                      imp.x = sx + (ox - sx) * e; imp.y = sy + (oy - sy) * e; imp.s = 0.55f + 0.45f * e
+                  }
+                  dmg = if (impT < 0.7f) 0f else if (impT < 0.9f) 1f else if (impT < 2.7f) 1f - ((impT - 0.9f) / 1.8f).let { it * it * (3f - 2f * it) } else 0f
+                  if (impT >= 2.7f) { impItem = null; dmg = 0f }
+              }
+
+              override fun draw(c: Canvas) {
+                  c.drawColor(0xFF04050E.toInt())
+                  starField(c, stars, w, h, 170)
+                  val shake = if (impItem != null && impT in 0.7f..1.1f) sin(impT * 70f) * 6f * v.dn * (1f - (impT - 0.7f) / 0.4f) else 0f
+                  c.save()
+                  c.translate(shake, shake * 0.4f)
+                  p.style = Paint.Style.FILL
+                  p.shader = glowSh; c.drawCircle(cx, cy, re * 1.45f, p)
+                  p.shader = oceanSh; c.drawCircle(cx, cy, re, p)
+                  p.shader = null
+                  c.save()
+                  path.reset(); path.addCircle(cx, cy, re, Path.Direction.CW); c.clipPath(path)
+                  p.color = green
+                  val rot = v.time * 0.15f
+                  var i = 0
+                  while (i < blobs.size) {
+                      val lon = blobs[i] + rot
+                      val cl = cos(lon)
+                      if (cl > 0f) {
+                          val lat = blobs[i + 1]
+                          val bx = cx + re * cos(lat) * sin(lon)
+                          val by = cy + re * sin(lat)
+                          val sz = re * blobs[i + 2]
+                          rf.set(bx - sz * cl, by - sz * 0.6f, bx + sz * cl, by + sz * 0.6f)
+                          c.drawOval(rf, p)
+                      }
+                      i += 3
+                  }
+                  if (dmg > 0.01f) {
+                      val hx = cx + cos(hitAng) * re * 0.8f
+                      val hy = cy + sin(hitAng) * re * 0.8f
+                      val k = 0.6f + 0.4f * dmg
+                      p.style = Paint.Style.FILL
+                      p.color = Color.argb((dmg * 220).toInt(), 60, 14, 6)
+                      c.drawCircle(hx, hy, re * 0.26f * k, p)
+                      p.style = Paint.Style.STROKE
+                      p.strokeWidth = re * 0.04f
+                      p.color = Color.argb((dmg * 255).toInt(), 255, 140, 40)
+                      c.drawCircle(hx, hy, re * 0.3f * k, p)
+                      for (q in 0..4) {
+                          val a = hitAng + PIF + (q - 2) * 0.5f
+                          c.drawLine(hx, hy, hx + cos(a) * re * 0.5f * dmg, hy + sin(a) * re * 0.5f * dmg, p)
+                      }
+                      p.style = Paint.Style.FILL
+                  }
+                  c.restore()
+                  c.restore()
+                  // clarão e estilhaços do impacto
+                  if (impItem != null && impT in 0.7f..1.6f) {
+                      val u = (impT - 0.7f) / 0.9f
+                      val hx = cx + cos(hitAng) * re
+                      val hy = cy + sin(hitAng) * re
+                      p.style = Paint.Style.FILL
+                      p.color = Color.argb(((1f - u) * 200).toInt(), 255, 240, 200)
+                      c.drawCircle(hx, hy, re * 0.45f * (1f - u * 0.5f), p)
+                      for (q in 0..9) {
+                          val a = hitAng + (q - 4.5f) * 0.28f
+                          p.color = Color.argb(((1f - u) * 255).toInt(), 255, 190, 110)
+                          c.drawCircle(hx + cos(a) * u * re * 0.9f, hy + sin(a) * u * re * 0.9f, 4f * v.dn * (1f - u), p)
+                      }
+                  }
+                  val imp = impItem
+                  for (it0 in v.games) if (it0 !== imp) v.drawItem(c, it0)
+                  for (it0 in v.apps) if (it0 !== imp) v.drawItem(c, it0)
+                  if (imp != null) v.drawItem(c, imp)
+              }
+          }
+
+          // ====================================================================== BURACO NEGRO
+          class BhEnv(v: SceneView) : Env(v) {
+              private val order = ArrayList<AppItem>()
+              private var sig = ""
+              private var w = 0f
+              private var h = 0f
+              private var cx = 0f
+              private var cy = 0f
+              private var rb = 0f
+              private var ir = 0f
+              private val ringR = FloatArray(3)
+              private var pull: AppItem? = null
+              private var pt = 0f
+              private var pr0 = 0f
+              private var phase = 0
+              private val stars = FloatArray(160)
+              private var glowSh: Shader? = null
+
+              init { fillStars(stars, 9L) }
+
+              private fun cap(r: Float): Int {
+                  var t = 0
+                  for (k in 0..2) t += max(1, floor(TAU * ringR[k] / (r * 2.5f)).toInt())
+                  return t
+              }
+
+              private fun assign(snap: Boolean) {
+                  var idx = 0
+                  for (k in 0..2) {
+                      if (idx >= order.size) break
+                      val cp = max(1, floor(TAU * ringR[k] / (ir * 2.5f)).toInt())
+                      val n = if (k == 2) order.size - idx else min(cp, order.size - idx)
+                      for (j in 0 until n) {
+                          val it0 = order[idx + j]
+                          it0.ring = k
+                          it0.wx = TAU * j / n
+                          it0.wy = ringR[k]
+                          it0.r = ir
+                          if (snap) { it0.ang = it0.wx; it0.rad = it0.wy }
+                      }
+                      idx += n
+                  }
+              }
+
+              override fun layout(w: Int, h: Int) {
+                  this.w = w.toFloat(); this.h = h.toFloat()
+                  cx = this.w / 2; cy = this.h * 0.5f
+                  val maxR = min(this.h * 0.30f, this.w * 0.27f)
+                  rb = maxR * 0.26f
+                  val sp = (maxR - rb * 1.9f) / 2f
+                  for (k in 0..2) ringR[k] = rb * 1.9f + sp * k
+                  ir = min(v.iconPx / 2f, sp * 0.44f)
+                  val s = (v.games + v.apps).joinToString(",") { it.pkg }
+                  if (s != sig) { sig = s; order.clear(); order.addAll(v.games); order.addAll(v.apps); pull = null; phase = 0 }
+                  while (ir > 11f * v.dn && cap(ir) < order.size) ir *= 0.93f
+                  assign(true)
+                  glowSh = RadialGradient(cx, cy, rb * 3.2f, intArrayOf(0x88FF9A3C.toInt(), 0x00FF9A3C), floatArrayOf(0.3f, 1f), Shader.TileMode.CLAMP)
+              }
+
+              override fun busy(): Boolean = pull != null
+
+              override fun tap(x: Float, y: Float): Boolean {
+                  if (pull != null || order.isEmpty() || hypot(x - cx, y - cy) > rb * 1.3f) return false
+                  val it0 = order[(Math.random() * order.size).toInt().coerceIn(0, order.size - 1)]
+                  pull = it0; pr0 = it0.rad; phase = 1; pt = 0f
+                  return true
+              }
+
+              private fun place(it0: AppItem) {
+                  val a = it0.ang + it0.sp
+                  it0.x = cx + cos(a) * it0.rad
+                  it0.y = cy + sin(a) * it0.rad
+              }
+
+              override fun update(dt: Float) {
+                  val span = ringR[2] - ringR[0] + 1f
+                  for (it0 in order) {
+                      if (it0 === pull) continue
+                      val k = min(1f, dt * 5f)
+                      var d = it0.wx - it0.ang
+                      while (d > PIF) d -= TAU
+                      while (d < -PIF) d += TAU
+                      it0.ang += d * k
+                      it0.rad += (it0.wy - it0.rad) * k
+                      it0.sp += dt * 0.22f * (1.25f - 0.5f * ((it0.rad - ringR[0]) / span))
+                      it0.r = ir; it0.s = 1f; it0.a = 1f
+                      place(it0)
+                  }
+                  val pl = pull ?: return
+                  pt += dt
+                  if (phase == 1) {
+                      val u = min(pt / 0.95f, 1f); val e = u * u
+                      pl.rad = pr0 * (1f - e)
+                      pl.ang += dt * (2f + 12f * e)
+                      pl.s = 1f - 0.95f * e; pl.a = 1f - 0.5f * e; pl.r = ir
+                      place(pl)
+                      if (u >= 1f) {
+                          val old = order.indexOf(pl)
+                          order.remove(pl)
+                          var ni = (Math.random() * (order.size + 1)).toInt().coerceIn(0, order.size)
+                          if (order.isNotEmpty() && ni == old) ni = (ni + 1 + (Math.random() * order.size).toInt()) % (order.size + 1)
+                          order.add(ni, pl)
+                          assign(false)
+                          pl.ang = pl.wx; pl.rad = pl.wy
+                          phase = 2; pt = 0f
+                      }
+                  } else if (phase == 2) {
+                      val u = min(pt / 0.6f, 1f)
+                      pl.s = 1f - (1f - u) * (1f - u) * (1f - u); pl.a = 1f; pl.r = ir
+                      pl.sp += dt * 0.22f
+                      place(pl)
+                      if (u >= 1f) { pull = null; phase = 0 }
+                  }
+              }
+
+              override fun draw(c: Canvas) {
+                  c.drawColor(0xFF02020A.toInt())
+                  starField(c, stars, w, h, 150)
+                  p.style = Paint.Style.FILL
+                  p.shader = glowSh; c.drawCircle(cx, cy, rb * 3.2f, p); p.shader = null
+                  c.save()
+                  c.rotate(v.time * 8f, cx, cy)
+                  c.scale(1f, 0.32f, cx, cy)
+                  p.style = Paint.Style.STROKE
+                  for (i in 0..3) {
+                      p.strokeWidth = rb * (0.22f - i * 0.03f)
+                      p.color = Color.argb(200 - i * 40, 255, 170 - i * 25, 60 + i * 20)
+                      c.drawCircle(cx, cy, rb * (1.25f + i * 0.28f), p)
+                  }
+                  c.restore()
+                  p.style = Paint.Style.FILL
+                  p.color = Color.BLACK
+                  c.drawCircle(cx, cy, rb, p)
+                  p.style = Paint.Style.STROKE
+                  p.strokeWidth = rb * 0.05f
+                  p.color = Color.argb(130, 255, 255, 255)
+                  c.drawCircle(cx, cy, rb * 1.02f, p)
+                  val pl = pull
+                  for (it0 in order) if (it0 !== pl) v.drawItem(c, it0)
+                  if (pl != null) v.drawItem(c, pl)
+              }
+          }
+
+          // ====================================================================== MAR
+          class SeaEnv(v: SceneView) : Env(v) {
+              private var w = 0f
+              private var h = 0f
+              private val zone = FloatArray(8)
+              private val rnd = java.util.Random(11)
+              private var ir = 0f
+              private var bg: Shader? = null
+
+              private fun items(g: Int) = if (g == 0) v.games else v.apps
+
+              override fun layout(w: Int, h: Int) {
+                  this.w = w.toFloat(); this.h = h.toFloat()
+                  if (Prefs.int("sea_split", 0) == 0) {
+                      zone[0] = this.w * 0.04f; zone[1] = this.h * 0.2f; zone[2] = this.w * 0.48f; zone[3] = this.h * 0.8f
+                      zone[4] = this.w * 0.52f; zone[5] = this.h * 0.2f; zone[6] = this.w * 0.96f; zone[7] = this.h * 0.8f
+                  } else {
+                      zone[0] = this.w * 0.05f; zone[1] = this.h * 0.19f; zone[2] = this.w * 0.95f; zone[3] = this.h * 0.48f
+                      zone[4] = this.w * 0.05f; zone[5] = this.h * 0.52f; zone[6] = this.w * 0.95f; zone[7] = this.h * 0.8f
+                  }
+                  var best = v.iconPx / 2f
+                  for (g in 0..1) {
+                      val area = (zone[g * 4 + 2] - zone[g * 4]) * (zone[g * 4 + 3] - zone[g * 4 + 1])
+                      best = min(best, sqrt(area * 0.30f / (max(items(g).size, 1) * PIF)))
+                  }
+                  ir = max(best, 11f * v.dn)
+                  for (g in 0..1) for (it0 in items(g)) {
+                      val l = zone[g * 4]; val t = zone[g * 4 + 1]; val r = zone[g * 4 + 2]; val b = zone[g * 4 + 3]
+                      if (it0.x < l || it0.x > r || it0.y < t || it0.y > b) {
+                          it0.x = l + rnd.nextFloat() * (r - l); it0.y = t + rnd.nextFloat() * (b - t)
+                          it0.wx = it0.x; it0.wy = it0.y; it0.tm = rnd.nextFloat() * 3f; it0.ph = rnd.nextFloat() * 6.28f
+                      }
+                      it0.r = ir; it0.s = 1f; it0.a = 1f
+                  }
+                  bg = LinearGradient(0f, 0f, 0f, this.h, intArrayOf(0xFF0C7BA8.toInt(), 0xFF0A4F82.toInt(), 0xFF052244.toInt()), null, Shader.TileMode.CLAMP)
+              }
+
+              override fun update(dt: Float) {
+                  val speed = (40f + Prefs.int("sea_speed", 50) * 1.6f) * v.dn
+                  for (g in 0..1) {
+                      val l = zone[g * 4]; val t = zone[g * 4 + 1]; val r = zone[g * 4 + 2]; val b = zone[g * 4 + 3]
+                      val list = items(g)
+                      for (it0 in list) {
+                          it0.tm -= dt
+                          val dx = it0.wx - it0.x
+                          val dy = it0.wy - it0.y
+                          val dist = hypot(dx, dy)
+                          if (it0.tm <= 0f || dist < it0.r) {
+                              it0.wx = l + ir + rnd.nextFloat() * (r - l - 2 * ir)
+                              it0.wy = t + ir + rnd.nextFloat() * (b - t - 2 * ir)
+                              it0.tm = 3f + rnd.nextFloat() * 6f
+                          }
+                          val len = max(1f, dist)
+                          val k = min(1f, dt * 0.9f)
+                          it0.vx += (dx / len * speed - it0.vx) * k
+                          it0.vy += (dy / len * speed - it0.vy) * k
+                          it0.x += it0.vx * dt
+                          it0.y += it0.vy * dt
+                          it0.r = ir; it0.s = 1f; it0.a = 1f
+                      }
+                      // sem sobreposição permanente: um empurra o outro
+                      for (i in 0 until list.size) for (j in i + 1 until list.size) {
+                          val a = list[i]; val c = list[j]
+                          val ddx = c.x - a.x; val ddy = c.y - a.y
+                          val d2 = ddx * ddx + ddy * ddy
+                          val md = (a.r + c.r) * 1.12f
+                          if (d2 < md * md && d2 > 0.01f) {
+                              val d = sqrt(d2)
+                              val push = (md - d) * 0.5f
+                              val nx = ddx / d; val ny = ddy / d
+                              a.x -= nx * push; a.y -= ny * push; c.x += nx * push; c.y += ny * push
+                          }
+                      }
+                      for (it0 in list) {
+                          it0.x = it0.x.coerceIn(l + ir, max(l + ir, r - ir))
+                          it0.y = it0.y.coerceIn(t + ir, max(t + ir, b - ir))
+                      }
+                  }
+              }
+
+              override fun draw(c: Canvas) {
+                  p.style = Paint.Style.FILL
+                  p.shader = bg; c.drawRect(0f, 0f, w, h, p); p.shader = null
+                  for (l in 0..2) {
+                      path.reset()
+                      val base = h * (0.1f + 0.055f * l)
+                      path.moveTo(0f, h)
+                      var x = 0f
+                      while (x <= w + 28f) {
+                          path.lineTo(x, base + sin(x * (0.004f + 0.002f * l) + v.time * (0.7f + 0.3f * l) + l) * h * 0.016f)
+                          x += 28f
+                      }
+                      path.lineTo(w, h); path.close()
+                      p.color = Color.argb(26 + 10 * l, 255, 255, 255)
+                      c.drawPath(path, p)
+                  }
+                  p.color = Color.argb(70, 255, 255, 255)
+                  p.textAlign = Paint.Align.LEFT
+                  p.textSize = h * 0.03f
+                  p.typeface = Typeface.DEFAULT_BOLD
+                  c.drawText("JOGOS", zone[0], zone[1] - h * 0.015f, p)
+                  c.drawText("APP", zone[4], zone[5] - h * 0.015f, p)
+                  for (g in 0..1) for (it0 in items(g)) {
+                      val oy = it0.y
+                      it0.y += sin(v.time * 1.4f + it0.ph) * it0.r * 0.12f
+                      v.drawItem(c, it0)
+                      it0.y = oy
+                  }
+              }
+          }
+
+          // ====================================================================== RP (casa viva)
+          class RpEnv(v: SceneView) : Env(v) {
+              private var w = 0f
+              private var h = 0f
+              private var x0 = 0f
+              private var x1 = 0f
+              private var gy = 0f
+              private var fh = 0f
+              private var roofH = 0f
+              private var floors = 2
+              private var ir = 0f
+              private val rnd = java.util.Random(5)
+              private val all = ArrayList<AppItem>()
+              private var lastKey = ""
+              private val stars = FloatArray(80)
+              private val avail = BooleanArray(6)
+              private var hour = 12
+              private var hourT = 0f
+              private var skySh: Shader? = null
+              private var skyNight = false
+
+              init { fillStars(stars, 21L) }
+
+              private fun xm() = (x0 + x1) / 2f
+              private fun floorY(f: Float) = gy - f * fh
+              private fun night() = hour < 6 || hour >= 19
+
+              /** Tipo de cômodo: 1 cozinha, 2 quarto, 3 esporte, 4 videogame, 5 sala (TV). */
+              private fun kind(f: Int, side: Int): Int = when (f % 3) {
+                  0 -> if (side == 0) 1 else 4
+                  1 -> if (side == 0) 2 else 3
+                  else -> if (side == 0) 2 else 5
+              }
+
+              override fun layout(w: Int, h: Int) {
+                  this.w = w.toFloat(); this.h = h.toFloat()
+                  all.clear(); all.addAll(v.games); all.addAll(v.apps)
+                  floors = ((all.size + 5) / 6).coerceIn(2, 6)
+                  x0 = this.w * 0.14f; x1 = this.w * 0.86f; gy = this.h * 0.80f
+                  roofH = this.h * 0.07f
+                  fh = (gy - this.h * 0.2f - roofH) / floors
+                  ir = min(v.iconPx / 2f, fh * 0.2f)
+                  for (i in 0..5) avail[i] = false
+                  for (f in 0 until floors) for (s in 0..1) avail[kind(f, s)] = true
+                  hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+                  val key = all.joinToString(",") { it.pkg } + floors
+                  if (key != lastKey) { lastKey = key; for (it0 in all) spawn(it0) }
+                  for (it0 in all) it0.r = ir
+              }
+
+              private fun spawn(it0: AppItem) {
+                  val days = if (it0.lastUsed > 0L) (System.currentTimeMillis() - it0.lastUsed) / 86400000f else 3f
+                  it0.energy = (1.1f - days / 6f).coerceIn(0.15f, 1f)
+                  it0.sleeper = days > 5f
+                  it0.floor = rnd.nextInt(floors); it0.yF = it0.floor.toFloat(); it0.tfloor = it0.floor
+                  it0.x = x0 + (x1 - x0) * (0.1f + 0.8f * rnd.nextFloat())
+                  it0.ph = rnd.nextFloat() * 6.28f
+                  it0.st = 0; it0.tm = rnd.nextFloat() * 2f; it0.act = 0
+              }
+
+              private fun decide(it0: AppItem) {
+                  val e = it0.energy
+                  val wg = floatArrayOf(0f, 1f, 0.7f, 1f, 1f, 1f)
+                  if (it0.game) { wg[4] *= 2.2f; wg[3] *= 1.4f; wg[1] *= 0.5f } else { wg[1] *= 1.6f; wg[5] *= 1.4f; wg[4] *= 0.6f }
+                  wg[2] *= (1.7f - e * 1.3f); wg[3] *= (0.4f + e); wg[4] *= (0.4f + e)
+                  if (it0.sleeper) wg[2] *= 12f
+                  for (i in 1..5) if (!avail[i]) wg[i] = 0f
+                  var tot = 0f
+                  for (i in 1..5) tot += wg[i]
+                  var r = rnd.nextFloat() * tot
+                  var a = 1
+                  for (i in 1..5) { r -= wg[i]; if (r <= 0f && wg[i] > 0f) { a = i; break } }
+                  it0.act = a
+                  val cf = ArrayList<IntArray>()
+                  for (f in 0 until floors) for (s in 0..1) if (kind(f, s) == a) cf.add(intArrayOf(f, s))
+                  val pick = cf[rnd.nextInt(cf.size)]
+                  val rw = xm() - x0
+                  val center = if (pick[1] == 0) x0 + rw / 2 else xm() + rw / 2
+                  it0.tfloor = pick[0]
+                  it0.wx = center + (rnd.nextFloat() - 0.5f) * rw * 0.5f
+                  it0.st = 1
+              }
+
+              private fun doTime(it0: AppItem): Float {
+                  val base = if (it0.act == 2) 12f + rnd.nextFloat() * 14f else 5f + rnd.nextFloat() * 8f
+                  return base * (if (it0.act == 2 && it0.sleeper) 2.2f else 1f)
+              }
+
+              override fun update(dt: Float) {
+                  hourT += dt
+                  if (hourT > 30f) { hourT = 0f; hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY) }
+                  val sp = 55f * v.dn
+                  for (it0 in all) {
+                      it0.r = ir; it0.s = 1f; it0.a = 1f
+                      when (it0.st) {
+                          0, 2 -> { it0.tm -= dt; if (it0.tm <= 0f) decide(it0) }
+                          1 -> {
+                              val speed = sp * (0.6f + it0.energy * 0.6f)
+                              if (it0.floor != it0.tfloor) {
+                                  val sx = xm()
+                                  if (abs(it0.x - sx) < 3f) { it0.x = sx; it0.st = 3; it0.tm = 0f }
+                                  else it0.x += sign(sx - it0.x) * min(abs(sx - it0.x), speed * dt)
+                              } else {
+                                  if (abs(it0.x - it0.wx) < 3f) { it0.st = 2; it0.tm = doTime(it0) }
+                                  else it0.x += sign(it0.wx - it0.x) * min(abs(it0.wx - it0.x), speed * dt)
+                              }
+                          }
+                          3 -> {
+                              it0.tm += dt
+                              val dir = if (it0.tfloor > it0.floor) 1 else -1
+                              it0.yF = it0.floor + dir * it0.tm.coerceIn(0f, 1f)
+                              if (it0.tm >= 1f) { it0.floor += dir; it0.yF = it0.floor.toFloat(); it0.st = 1 }
+                          }
+                      }
+                      val sleeping = it0.st == 2 && it0.act == 2
+                      it0.y = floorY(it0.yF) - (if (sleeping) ir * 0.95f else ir * 1.55f)
+                  }
+              }
+
+              private fun sky(night: Boolean): Shader {
+                  if (skySh == null || skyNight != night) {
+                      skyNight = night
+                      skySh = LinearGradient(0f, 0f, 0f, gy,
+                          if (night) intArrayOf(0xFF0A0F2C.toInt(), 0xFF1B2550.toInt()) else intArrayOf(0xFF5CB8FF.toInt(), 0xFFCFEBFF.toInt()),
+                          null, Shader.TileMode.CLAMP)
+                  }
+                  return skySh!!
+              }
+
+              private fun furniture(c: Canvas, kind: Int, rx0: Float, rx1: Float, fy: Float) {
+                  val cx = (rx0 + rx1) / 2
+                  val rw = rx1 - rx0
+                  p.style = Paint.Style.FILL
+                  p.shader = null
+                  when (kind) {
+                      1 -> {
+                          p.color = 0xFF8D6E63.toInt(); c.drawRect(cx - rw * 0.22f, fy - fh * 0.28f, cx + rw * 0.22f, fy, p)
+                          p.color = 0xFF37474F.toInt(); c.drawRect(cx - rw * 0.2f, fy - fh * 0.3f, cx + rw * 0.2f, fy - fh * 0.28f, p)
+                          for (k in 0..2) {
+                              val u = (v.time * 0.6f + k * 0.33f) % 1f
+                              p.color = Color.argb(((1f - u) * 130).toInt(), 255, 255, 255)
+                              c.drawCircle(cx - rw * 0.1f + k * rw * 0.1f, fy - fh * 0.32f - u * fh * 0.3f, fh * 0.03f * (1f + u), p)
+                          }
+                      }
+                      2 -> {
+                          p.color = 0xFF7E57C2.toInt(); c.drawRect(cx - rw * 0.28f, fy - fh * 0.16f, cx + rw * 0.28f, fy - fh * 0.05f, p)
+                          p.color = 0xFFECEFF1.toInt(); c.drawRect(cx - rw * 0.28f, fy - fh * 0.2f, cx - rw * 0.18f, fy - fh * 0.16f, p)
+                          p.color = 0xFF4E342E.toInt(); c.drawRect(cx - rw * 0.28f, fy - fh * 0.05f, cx - rw * 0.26f, fy, p); c.drawRect(cx + rw * 0.26f, fy - fh * 0.05f, cx + rw * 0.28f, fy, p)
+                      }
+                      3 -> {
+                          p.color = 0xFF455A64.toInt(); c.drawRect(cx - rw * 0.25f, fy - fh * 0.08f, cx + rw * 0.25f, fy, p)
+                          p.color = 0xFF90A4AE.toInt()
+                          for (k in 0..4) { val sx = cx - rw * 0.25f + ((v.time * 40f * v.dn + k * rw * 0.1f) % (rw * 0.5f)); c.drawRect(sx, fy - fh * 0.08f, sx + rw * 0.02f, fy, p) }
+                      }
+                      4 -> {
+                          p.color = 0xFF263238.toInt(); c.drawRect(cx - rw * 0.12f, fy - fh * 0.5f, cx + rw * 0.12f, fy - fh * 0.28f, p)
+                          p.color = Color.HSVToColor(floatArrayOf((v.time * 60f) % 360f, 0.6f, 0.95f)); c.drawRect(cx - rw * 0.105f, fy - fh * 0.485f, cx + rw * 0.105f, fy - fh * 0.295f, p)
+                          p.color = 0xFF37474F.toInt(); c.drawRect(cx - rw * 0.08f, fy - fh * 0.12f, cx + rw * 0.08f, fy - fh * 0.04f, p)
+                      }
+                      else -> {
+                          p.color = 0xFF5D4037.toInt(); c.drawRect(cx - rw * 0.3f, fy - fh * 0.2f, cx - rw * 0.02f, fy, p)
+                          p.color = 0xFF263238.toInt(); c.drawRect(cx + rw * 0.1f, fy - fh * 0.42f, cx + rw * 0.32f, fy - fh * 0.22f, p)
+                          p.color = Color.argb((120 + 100 * abs(sin(v.time * 3f))).toInt(), 140, 190, 255); c.drawRect(cx + rw * 0.115f, fy - fh * 0.405f, cx + rw * 0.305f, fy - fh * 0.235f, p)
+                      }
+                  }
+              }
+
+              private fun drawChar(c: Canvas, it0: AppItem) {
+                  val sleeping = it0.st == 2 && it0.act == 2
+                  val moving = it0.st == 1 || it0.st == 3
+                  val fy = floorY(it0.yF)
+                  p.style = Paint.Style.FILL; p.shader = null
+                  p.color = Color.argb(60, 0, 0, 0)
+                  rf.set(it0.x - ir, fy - ir * 0.15f, it0.x + ir, fy + ir * 0.15f)
+                  c.drawOval(rf, p)
+                  if (!sleeping) {
+                      val sw = if (moving) sin(v.time * 10f + it0.ph) * ir * 0.35f else 0f
+                      p.style = Paint.Style.STROKE; p.strokeWidth = ir * 0.22f; p.strokeCap = Paint.Cap.ROUND
+                      p.color = Color.argb(230, 255, 255, 255)
+                      c.drawLine(it0.x - ir * 0.3f, fy - ir * 0.55f, it0.x - ir * 0.3f + sw, fy, p)
+                      c.drawLine(it0.x + ir * 0.3f, fy - ir * 0.55f, it0.x + ir * 0.3f - sw, fy, p)
+                      p.strokeCap = Paint.Cap.BUTT
+                  }
+                  if (sleeping) { c.save(); c.rotate(90f, it0.x, it0.y); v.drawItem(c, it0); c.restore() } else v.drawItem(c, it0)
+                  p.style = Paint.Style.FILL
+                  if (sleeping) {
+                      p.typeface = Typeface.DEFAULT_BOLD; p.textAlign = Paint.Align.LEFT
+                      for (k in 0..2) {
+                          val u = (v.time * 0.5f + k * 0.33f) % 1f
+                          p.color = Color.argb(((1f - u) * 220).toInt(), 255, 255, 255)
+                          p.textSize = ir * (0.5f + u * 0.5f)
+                          c.drawText("z", it0.x + ir * (0.9f + u * 0.6f), it0.y - ir * (0.6f + u * 1.4f), p)
+                      }
+                  } else if (it0.st == 2 && it0.act == 3) {
+                      p.color = 0xFFFF8F00.toInt()
+                      c.drawCircle(it0.x + ir * 1.1f, fy - ir * 0.4f - abs(sin(v.time * 7f + it0.ph)) * ir * 1.2f, ir * 0.3f, p)
+                  } else if (it0.st == 2 && it0.act == 4) {
+                      p.color = 0xFF37474F.toInt()
+                      rf.set(it0.x - ir * 0.5f, it0.y + ir * 0.8f, it0.x + ir * 0.5f, it0.y + ir * 1.15f)
+                      c.drawRoundRect(rf, ir * 0.15f, ir * 0.15f, p)
+                  } else if (it0.st == 2 && it0.act == 1) {
+                      p.style = Paint.Style.STROKE; p.strokeWidth = ir * 0.12f; p.color = 0xFFBCAAA4.toInt()
+                      c.drawLine(it0.x + ir * 0.9f, it0.y + ir * 0.5f, it0.x + ir * 1.3f + sin(v.time * 6f) * ir * 0.2f, it0.y - ir * 0.3f, p)
+                      p.style = Paint.Style.FILL
+                  }
+              }
+
+              override fun draw(c: Canvas) {
+                  val ng = night()
+                  p.style = Paint.Style.FILL
+                  p.shader = sky(ng); c.drawRect(0f, 0f, w, gy, p); p.shader = null
+                  if (ng) starField(c, stars, w, gy, 200)
+                  p.color = if (ng) 0xFF14301C.toInt() else 0xFF5FAE5B.toInt()
+                  c.drawRect(0f, gy, w, h, p)
+                  val top = gy - floors * fh
+                  path.reset(); path.moveTo(x0 - w * 0.02f, top); path.lineTo(xm(), top - roofH); path.lineTo(x1 + w * 0.02f, top); path.close()
+                  p.color = 0xFFB5473B.toInt(); c.drawPath(path, p)
+                  p.color = if (ng) 0xFF3A3F63.toInt() else 0xFFF2E8D8.toInt()
+                  c.drawRect(x0, top, x1, gy, p)
+                  p.style = Paint.Style.STROKE
+                  p.color = if (ng) 0xFF1C1F36.toInt() else 0xFF9A8B78.toInt()
+                  p.strokeWidth = 4f * v.dn
+                  for (f in 0..floors) c.drawLine(x0, floorY(f.toFloat()), x1, floorY(f.toFloat()), p)
+                  c.drawLine(x0, top, x0, gy, p); c.drawLine(x1, top, x1, gy, p)
+                  p.strokeWidth = 2f * v.dn
+                  for (f in 0 until floors) c.drawLine(xm(), floorY(f.toFloat()) - fh, xm(), floorY(f.toFloat()) - fh * 0.5f, p)
+                  p.strokeWidth = 5f * v.dn
+                  p.color = 0xFF8D6E63.toInt()
+                  for (f in 0 until floors - 1) c.drawLine(xm() - fh * 0.22f, floorY(f.toFloat()), xm() + fh * 0.22f, floorY((f + 1).toFloat()), p)
+                  for (f in 0 until floors) for (s in 0..1) {
+                      furniture(c, kind(f, s), if (s == 0) x0 else xm(), if (s == 0) xm() else x1, floorY(f.toFloat()))
+                  }
+                  for (it0 in all) drawChar(c, it0)
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/horizonlauncher/Prefs.kt <<'EOF'
+          package com.horizonlauncher
+
+          import android.content.Context
+          import android.content.SharedPreferences
+
+          /** Todas as configurações do launcher ficam salvas aqui. */
+          object Prefs {
+              private lateinit var sp: SharedPreferences
+
+              fun init(c: Context) {
+                  if (!::sp.isInitialized) sp = c.applicationContext.getSharedPreferences("horizon", Context.MODE_PRIVATE)
+              }
+
+              fun bool(k: String, d: Boolean): Boolean = sp.getBoolean(k, d)
+              fun putBool(k: String, v: Boolean) = sp.edit().putBoolean(k, v).apply()
+              fun int(k: String, d: Int): Int = sp.getInt(k, d)
+              fun putInt(k: String, v: Int) = sp.edit().putInt(k, v).apply()
+              fun long(k: String, d: Long): Long = sp.getLong(k, d)
+              fun putLong(k: String, v: Long) = sp.edit().putLong(k, v).apply()
+              fun str(k: String, d: String): String = sp.getString(k, d) ?: d
+              fun putStr(k: String, v: String) = sp.edit().putString(k, v).apply()
+              fun strs(k: String): Set<String> = sp.getStringSet(k, emptySet()) ?: emptySet()
+              fun putStrs(k: String, v: Set<String>) = sp.edit().putStringSet(k, HashSet(v)).apply()
+              fun resetAll() = sp.edit().clear().apply()
+          }
+          EOF
+          cat > app/src/main/java/com/horizonlauncher/SceneView.kt <<'EOF'
+          package com.horizonlauncher
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.DashPathEffect
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.Rect
+          import android.graphics.RectF
+          import android.graphics.Typeface
+          import android.graphics.drawable.AnimatedImageDrawable
+          import android.graphics.drawable.Drawable
+          import android.os.SystemClock
+          import android.view.MotionEvent
+          import android.view.View
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import kotlin.math.abs
+          import kotlin.math.cos
+          import kotlin.math.hypot
+          import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.sin
+
+          private class Trans(val snap: Bitmap, val kind: Int, val t0: Long, val dur: Long)
+
+          /**
+           * A tela inteira do launcher desenhada em Canvas: ambiente (fundo + apps), widgets, relógio,
+           * Wi-Fi, bateria, três círculos, engrenagem e setas. Os 6 ambientes ficam em Modes.kt.
+           */
+          class SceneView(c: Context) : View(c) {
+              val dn = resources.displayMetrics.density
+              var games: List<AppItem> = emptyList()
+              var apps: List<AppItem> = emptyList()
+              var mode = 0
+              var wallDrawable: Drawable? = null
+              var wallVideo = false
+              var bgColor = Color.BLACK
+              var batLevel = 100
+              var charging = false
+              var wifi = -1
+              var ringer = 2
+              var showArrows = true
+              var anim = 0
+              var transOn = true
+              var widgets: List<Widget> = emptyList()
+              var time = 0f
+              var moveWidget: Widget? = null
+              var onOpen: (AppItem) -> Unit = {}
+              var onMenu: (AppItem) -> Unit = {}
+              var onHud: (String) -> Unit = {}
+              var onWidget: (Widget, Boolean) -> Unit = { _, _ -> }
+              var onWidgetMoved: () -> Unit = {}
+
+              val iconPx: Float get() = Prefs.int("icon_dp", 56) * dn
+
+              private val envs by lazy {
+                  listOf<Env>(ListEnv(this, false), TerraEnv(this), BhEnv(this), SeaEnv(this), RpEnv(this), ListEnv(this, true))
+              }
+              val env: Env get() = envs[mode]
+
+              val ip = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+              private val shadowP = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val tp = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val rf = RectF()
+              private val src = Rect()
+              private val path = Path()
+              private val fmt = SimpleDateFormat("HH:mm", Locale.getDefault())
+              private var lastMin = -1L
+              private var clockStr = ""
+
+              private var trans: Trans? = null
+              private var running = false
+              private var last = 0L
+              private var downX = 0f
+              private var downY = 0f
+              private var lastY = 0f
+              private var lastT = 0L
+              private var offX = 0f
+              private var offY = 0f
+              private var moved = false
+              private var longFired = false
+              private var touching = false
+              private var downItem: AppItem? = null
+              private var downWidget: Widget? = null
+              private var downHud: String? = null
+
+              private val cb = object : Drawable.Callback {
+                  override fun invalidateDrawable(who: Drawable) { invalidate() }
+                  override fun scheduleDrawable(who: Drawable, what: Runnable, whenMs: Long) {
+                      postDelayed(what, max(0L, whenMs - SystemClock.uptimeMillis()))
+                  }
+                  override fun unscheduleDrawable(who: Drawable, what: Runnable) { removeCallbacks(what) }
+              }
+
+              private val loop = object : Runnable {
+                  override fun run() {
+                      if (!running) return
+                      val now = SystemClock.uptimeMillis()
+                      val dt = min((now - last) / 1000f, 0.05f)
+                      last = now
+                      step(dt)
+                      invalidate()
+                      if (!needLoop()) { running = false; return }
+                      val iv = if (anim == 1 && trans == null && !touching && !env.busy()) 66L else if (mode == 3 || mode == 4) 33L else 16L
+                      postDelayed(this, iv)
+                  }
+              }
+
+              private val longRun = Runnable {
+                  longFired = true
+                  val it0 = downItem
+                  val wd = downWidget
+                  if (it0 != null) onMenu(it0) else if (wd != null) onWidget(wd, true)
+              }
+
+              private val minuteTick = object : Runnable {
+                  override fun run() {
+                      invalidate()
+                      postDelayed(this, 30000L)
+                  }
+              }
+
+              // ---------------------------------------------------------------- ciclo de vida do desenho
+              private fun needLoop() = anim != 2 || trans != null || env.busy() || touching
+
+              fun start() {
+                  if (running) return
+                  running = true
+                  last = SystemClock.uptimeMillis()
+                  post(loop)
+              }
+
+              fun stop() {
+                  running = false
+                  removeCallbacks(loop)
+              }
+
+              fun kick() = start()
+
+              private fun step(dt: Float) {
+                  time += dt
+                  env.update(dt)
+                  val t = trans
+                  if (t != null && SystemClock.uptimeMillis() - t.t0 >= t.dur) {
+                      trans = null
+                      t.snap.recycle()
+                  }
+              }
+
+              override fun onAttachedToWindow() {
+                  super.onAttachedToWindow()
+                  postDelayed(minuteTick, 30000L)
+              }
+
+              override fun onDetachedFromWindow() {
+                  removeCallbacks(minuteTick)
+                  stop()
+                  super.onDetachedFromWindow()
+              }
+
+              override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
+                  layoutAll()
+              }
+
+              fun setItems(g: List<AppItem>, a: List<AppItem>) {
+                  games = g
+                  apps = a
+                  layoutAll()
+              }
+
+              fun layoutAll() {
+                  if (width <= 0) return
+                  for (e in envs) e.layout(width, height)
+                  env.update(0f)
+                  invalidate()
+              }
+
+              fun setMode(m: Int, animate: Boolean) {
+                  if (m == mode) return
+                  if (animate && transOn) beginTransition(m)
+                  mode = m
+                  env.update(0f)
+                  kick()
+              }
+
+              // ---------------------------------------------------------------- transições
+              private fun snapshot(): Bitmap? = try {
+                  val b = Bitmap.createBitmap(max(1, width / 2), max(1, height / 2), Bitmap.Config.ARGB_8888)
+                  val cv = Canvas(b)
+                  cv.scale(0.5f, 0.5f)
+                  drawScene(cv)
+                  b
+              } catch (_: Throwable) {
+                  null
+              }
+
+              /** kind = ambiente de destino (0..5). 5 também é usado quando o wallpaper é trocado. */
+              fun beginTransition(kind: Int) {
+                  if (width <= 0 || !transOn) return
+                  val old = trans
+                  if (old != null) { trans = null; old.snap.recycle() }
+                  val b = snapshot() ?: return
+                  trans = Trans(b, kind, SystemClock.uptimeMillis(), if (kind == 4) 850L else 950L)
+                  kick()
+              }
+
+              private fun ease(t: Float) = t * t * (3f - 2f * t)
+
+              private fun drawTrans(c: Canvas, t: Trans) {
+                  val k = ((SystemClock.uptimeMillis() - t.t0).toFloat() / t.dur).coerceIn(0f, 1f)
+                  val e = ease(k)
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  rf.set(0f, 0f, w, h)
+                  ip.alpha = 255
+                  when (t.kind) {
+                      1 -> { // TERRA: o ambiente antigo se afasta como quem entra na atmosfera
+                          c.save(); c.scale(1f + 1.1f * e, 1f + 1.1f * e, w / 2, h / 2)
+                          ip.alpha = ((1f - k) * 255).toInt(); c.drawBitmap(t.snap, null, rf, ip); c.restore()
+                      }
+                      2 -> { // BURACO NEGRO: o antigo gira e é engolido pelo centro
+                          c.save(); c.rotate(540f * e, w / 2, h / 2); val s = 1f - 0.97f * e; c.scale(s, s, w / 2, h / 2)
+                          ip.alpha = ((1f - k * k) * 255).toInt(); c.drawBitmap(t.snap, null, rf, ip); c.restore()
+                      }
+                      3 -> { // MAR: uma onda desce e revela o novo ambiente
+                          val amp = h * 0.05f
+                          path.reset()
+                          var x = 0f
+                          path.moveTo(0f, 0f)
+                          while (x <= w + 30f) {
+                              val y = -amp + (h + 2 * amp) * e + amp * sin(x * 0.012f + e * 14f)
+                              if (x == 0f) path.moveTo(0f, y) else path.lineTo(x, y)
+                              x += 30f
+                          }
+                          path.lineTo(w, h); path.lineTo(0f, h); path.close()
+                          c.save(); c.clipPath(path); c.drawBitmap(t.snap, null, rf, ip); c.restore()
+                      }
+                      4 -> { // RP: o antigo desliza como uma porta
+                          c.save(); c.translate(-w * e, 0f); ip.alpha = ((1f - 0.5f * k) * 255).toInt()
+                          c.drawBitmap(t.snap, null, rf, ip); c.restore()
+                      }
+                      5 -> { // WALLPAPER: troca suave com um leve zoom
+                          c.save(); val s = 1f + 0.06f * e; c.scale(s, s, w / 2, h / 2)
+                          ip.alpha = ((1f - e) * 255).toInt(); c.drawBitmap(t.snap, null, rf, ip); c.restore()
+                      }
+                      else -> { // SISTEMA: esmaece
+                          ip.alpha = ((1f - e) * 255).toInt(); c.drawBitmap(t.snap, null, rf, ip)
+                      }
+                  }
+                  ip.alpha = 255
+              }
+
+              // ---------------------------------------------------------------- animações de wallpaper e widgets
+              fun attachAnim(d: Drawable?) {
+                  if (d == null) return
+                  d.callback = cb
+                  if (d is AnimatedImageDrawable) d.repeatCount = AnimatedImageDrawable.REPEAT_INFINITE
+              }
+
+              fun setAnimPlaying(play: Boolean) {
+                  val all = listOf(wallDrawable) + widgets.map { it.anim }
+                  for (d in all) if (d is AnimatedImageDrawable) { if (play) d.start() else d.stop() }
+              }
+
+              // ---------------------------------------------------------------- desenho
+              fun drawItem(c: Canvas, it0: AppItem) {
+                  if (it0.a <= 0.01f || it0.s <= 0.01f) return
+                  val r = it0.r * it0.s
+                  shadowP.style = Paint.Style.FILL
+                  shadowP.color = Color.argb((it0.a * 70).toInt(), 0, 0, 0)
+                  c.drawCircle(it0.x + r * 0.06f, it0.y + r * 0.1f, r, shadowP)
+                  rf.set(it0.x - r, it0.y - r, it0.x + r, it0.y + r)
+                  ip.alpha = (it0.a * 255).toInt()
+                  c.drawBitmap(it0.icon, null, rf, ip)
+                  ip.alpha = 255
+                  if (it0.game) {
+                      shadowP.style = Paint.Style.STROKE
+                      shadowP.strokeWidth = max(1.5f, r * 0.05f)
+                      shadowP.color = Color.argb((it0.a * 170).toInt(), 110, 175, 255)
+                      c.drawCircle(it0.x, it0.y, r, shadowP)
+                  }
+              }
+
+              fun drawWall(c: Canvas) {
+                  val d = wallDrawable
+                  if (d == null) { c.drawColor(Color.BLACK); return }
+                  val iw = max(d.intrinsicWidth, 1)
+                  val ih = max(d.intrinsicHeight, 1)
+                  val s = max(width / iw.toFloat(), height / ih.toFloat())
+                  val dw = (iw * s).toInt()
+                  val dh = (ih * s).toInt()
+                  val l = (width - dw) / 2
+                  val t = (height - dh) / 2
+                  d.setBounds(l, t, l + dw, t + dh)
+                  d.draw(c)
+              }
+
+              private fun drawScene(c: Canvas) {
+                  env.draw(c)
+                  drawWidgets(c)
+              }
+
+              override fun onDraw(c: Canvas) {
+                  drawScene(c)
+                  val t = trans
+                  if (t != null) drawTrans(c, t)
+                  drawHud(c)
+              }
+
+              private fun resetP(style: Paint.Style) {
+                  tp.shader = null
+                  tp.style = style
+                  tp.pathEffect = null
+                  tp.clearShadowLayer()
+                  tp.typeface = Typeface.DEFAULT
+                  tp.textAlign = Paint.Align.LEFT
+                  tp.strokeCap = Paint.Cap.BUTT
+                  tp.letterSpacing = 0f
+              }
+
+              private fun fitText(s: String, maxW: Float): String {
+                  val n = tp.breakText(s, true, maxW, null)
+                  return if (n >= s.length) s else s.substring(0, max(0, n - 1)) + "…"
+              }
+
+              private fun drawCrop(c: Canvas, b: Bitmap, r: RectF) {
+                  val s = max(r.width() / b.width, r.height() / b.height)
+                  val sw = r.width() / s
+                  val sh = r.height() / s
+                  src.set(((b.width - sw) / 2).toInt(), ((b.height - sh) / 2).toInt(), ((b.width + sw) / 2).toInt(), ((b.height + sh) / 2).toInt())
+                  c.drawBitmap(b, src, r, ip)
+              }
+
+              fun layoutWidgets() {
+                  for (w in widgets) {
+                      val ww = w.fw * width
+                      val hh = if (w.type == "link" || w.type == "sound") max(ww * 0.32f, 56 * dn) else ww * 9f / 16f
+                      w.rect.set(w.fx * width, w.fy * height, w.fx * width + ww, w.fy * height + hh)
+                  }
+              }
+
+              private fun drawWidgets(c: Canvas) {
+                  if (!Prefs.bool("widgets_on", false)) return
+                  layoutWidgets()
+                  for (w in widgets) {
+                      c.save()
+                      path.reset()
+                      path.addRoundRect(w.rect, 16 * dn, 16 * dn, Path.Direction.CW)
+                      c.clipPath(path)
+                      resetP(Paint.Style.FILL)
+                      tp.color = Color.argb(170, 30, 30, 50)
+                      c.drawRect(w.rect, tp)
+                      when (w.type) {
+                          "gif" -> {
+                              val d = w.anim
+                              if (d != null) { d.setBounds(w.rect.left.toInt(), w.rect.top.toInt(), w.rect.right.toInt(), w.rect.bottom.toInt()); d.draw(c) }
+                          }
+                          "photo" -> { val b = w.bmp; if (b != null) drawCrop(c, b, w.rect) }
+                          "video" -> {
+                              val b = w.bmp
+                              if (b != null) drawCrop(c, b, w.rect)
+                              tp.color = Color.argb(200, 255, 255, 255)
+                              val cx = w.rect.centerX(); val cy = w.rect.centerY(); val s = w.rect.height() * 0.18f
+                              path.reset(); path.moveTo(cx - s * 0.6f, cy - s); path.lineTo(cx - s * 0.6f, cy + s); path.lineTo(cx + s, cy); path.close()
+                              c.drawPath(path, tp)
+                          }
+                          else -> {
+                              tp.color = Color.WHITE
+                              tp.textSize = w.rect.height() * 0.3f
+                              tp.typeface = Typeface.DEFAULT_BOLD
+                              val icon = if (w.type == "sound") (if (w.playing) "■" else "▶") else "🔗"
+                              c.drawText(icon, w.rect.left + w.rect.height() * 0.25f, w.rect.centerY() + tp.textSize * 0.35f, tp)
+                              val tx = w.rect.left + w.rect.height() * 1.0f
+                              tp.textSize = w.rect.height() * 0.24f
+                              tp.typeface = Typeface.DEFAULT_BOLD
+                              c.drawText(fitText(w.title.ifEmpty { w.data }, w.rect.right - tx - 10 * dn), tx, w.rect.centerY() - tp.textSize * 0.1f, tp)
+                              if (w.type == "link") {
+                                  tp.typeface = Typeface.DEFAULT
+                                  tp.textSize = w.rect.height() * 0.17f
+                                  tp.color = Color.argb(170, 255, 255, 255)
+                                  c.drawText(fitText(w.data, w.rect.right - tx - 10 * dn), tx, w.rect.centerY() + tp.textSize * 1.6f, tp)
+                              }
+                          }
+                      }
+                      c.restore()
+                      if (moveWidget === w) {
+                          resetP(Paint.Style.STROKE)
+                          tp.strokeWidth = 3 * dn
+                          tp.color = Color.parseColor("#FFD400")
+                          tp.pathEffect = DashPathEffect(floatArrayOf(14f, 10f), 0f)
+                          c.drawRoundRect(w.rect, 16 * dn, 16 * dn, tp)
+                      }
+                  }
+              }
+
+              // ---------------------------------------------------------------- HUD (relógio, Wi-Fi, bateria, círculos, engrenagem, setas)
+              private fun circlesY() = if (mode == 0 || mode == 5) height * 0.52f else height * 0.86f
+              private fun circleX(i: Int) = width / 2f + (i - 1) * height * 0.16f
+              private fun cr() = height * 0.055f
+
+              private fun drawWifi(c: Canvas, cx: Float, cy: Float, s: Float) {
+                  resetP(Paint.Style.STROKE)
+                  tp.strokeCap = Paint.Cap.ROUND
+                  tp.strokeWidth = s * 0.17f
+                  val on = wifi >= 0
+                  for (i in 1..3) {
+                      val r = s * 0.42f * i
+                      tp.color = Color.argb(if (on && i <= max(wifi, 1)) 255 else 70, 255, 255, 255)
+                      rf.set(cx - r, cy + s * 0.5f - r, cx + r, cy + s * 0.5f + r)
+                      c.drawArc(rf, 225f, 90f, false, tp)
+                  }
+                  tp.style = Paint.Style.FILL
+                  tp.color = Color.argb(if (on) 255 else 70, 255, 255, 255)
+                  c.drawCircle(cx, cy + s * 0.5f, s * 0.1f, tp)
+                  if (!on) {
+                      tp.style = Paint.Style.STROKE
+                      tp.color = Color.argb(200, 255, 80, 80)
+                      c.drawLine(cx - s * 0.6f, cy - s * 0.2f, cx + s * 0.6f, cy + s * 0.7f, tp)
+                  }
+              }
+
+              private fun drawBattery(c: Canvas, x: Float, cy: Float, s: Float) {
+                  resetP(Paint.Style.STROKE)
+                  tp.strokeWidth = s * 0.1f
+                  tp.color = Color.WHITE
+                  rf.set(x, cy - s * 0.5f, x + s * 1.9f, cy + s * 0.5f)
+                  c.drawRoundRect(rf, s * 0.15f, s * 0.15f, tp)
+                  tp.style = Paint.Style.FILL
+                  c.drawRect(x + s * 1.9f, cy - s * 0.18f, x + s * 2.05f, cy + s * 0.18f, tp)
+                  tp.color = if (charging) Color.parseColor("#4CE08A") else if (batLevel <= 15) Color.parseColor("#FF5252") else Color.WHITE
+                  rf.set(x + s * 0.12f, cy - s * 0.38f, x + s * 0.12f + (s * 1.66f) * batLevel / 100f, cy + s * 0.38f)
+                  c.drawRoundRect(rf, s * 0.08f, s * 0.08f, tp)
+                  tp.color = Color.WHITE
+                  tp.textSize = s * 0.95f
+                  tp.typeface = Typeface.DEFAULT_BOLD
+                  c.drawText(batLevel.toString() + "%" + (if (charging) " ⚡" else ""), x + s * 2.3f, cy + s * 0.33f, tp)
+              }
+
+              private fun drawSound(c: Canvas, cx: Float, cy: Float, r: Float) {
+                  resetP(Paint.Style.FILL)
+                  tp.color = Color.WHITE
+                  if (ringer == 1) {
+                      rf.set(cx - r * 0.16f, cy - r * 0.34f, cx + r * 0.16f, cy + r * 0.34f)
+                      tp.style = Paint.Style.STROKE; tp.strokeWidth = r * 0.09f; tp.strokeCap = Paint.Cap.ROUND
+                      c.drawRoundRect(rf, r * 0.06f, r * 0.06f, tp)
+                      for (k in 1..2) {
+                          val rr = r * (0.28f + 0.14f * k)
+                          rf.set(cx - rr, cy - rr, cx + rr, cy + rr)
+                          c.drawArc(rf, 150f, 60f, false, tp)
+                          c.drawArc(rf, -30f, 60f, false, tp)
+                      }
+                      return
+                  }
+                  path.reset()
+                  path.moveTo(cx - r * 0.42f, cy - r * 0.16f); path.lineTo(cx - r * 0.2f, cy - r * 0.16f); path.lineTo(cx + r * 0.05f, cy - r * 0.38f)
+                  path.lineTo(cx + r * 0.05f, cy + r * 0.38f); path.lineTo(cx - r * 0.2f, cy + r * 0.16f); path.lineTo(cx - r * 0.42f, cy + r * 0.16f); path.close()
+                  c.drawPath(path, tp)
+                  tp.style = Paint.Style.STROKE; tp.strokeWidth = r * 0.09f; tp.strokeCap = Paint.Cap.ROUND
+                  if (ringer == 2) {
+                      for (k in 1..2) {
+                          val rr = r * (0.18f + 0.2f * k)
+                          rf.set(cx + r * 0.05f - rr, cy - rr, cx + r * 0.05f + rr, cy + rr)
+                          c.drawArc(rf, -45f, 90f, false, tp)
+                      }
+                  } else {
+                      tp.color = Color.parseColor("#FF5252")
+                      c.drawLine(cx - r * 0.5f, cy - r * 0.5f, cx + r * 0.5f, cy + r * 0.5f, tp)
+                  }
+              }
+
+              private fun drawGear(c: Canvas, gx: Float, gy: Float, gr: Float) {
+                  resetP(Paint.Style.FILL)
+                  tp.color = Color.argb(220, 255, 255, 255)
+                  for (i in 0 until 8) {
+                      c.save(); c.rotate(i * 45f, gx, gy)
+                      rf.set(gx - gr * 0.16f, gy - gr * 1.05f, gx + gr * 0.16f, gy - gr * 0.65f)
+                      c.drawRect(rf, tp); c.restore()
+                  }
+                  tp.style = Paint.Style.STROKE
+                  tp.strokeWidth = gr * 0.3f
+                  c.drawCircle(gx, gy, gr * 0.62f, tp)
+              }
+
+              private fun drawChevron(c: Canvas, x: Float, cy: Float, s: Float, dir: Int) {
+                  resetP(Paint.Style.STROKE)
+                  tp.strokeCap = Paint.Cap.ROUND
+                  tp.strokeWidth = s * 0.28f
+                  tp.color = Color.argb(150, 255, 255, 255)
+                  path.reset()
+                  path.moveTo(x + dir * s * 0.35f, cy - s); path.lineTo(x - dir * s * 0.35f, cy); path.lineTo(x + dir * s * 0.35f, cy + s)
+                  c.drawPath(path, tp)
+              }
+
+              private fun drawHud(c: Canvas) {
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  val m = System.currentTimeMillis() / 60000
+                  if (m != lastMin) { lastMin = m; clockStr = fmt.format(Date()) }
+                  resetP(Paint.Style.FILL)
+                  tp.color = Color.WHITE
+                  tp.typeface = Typeface.DEFAULT_BOLD
+                  tp.textAlign = Paint.Align.CENTER
+                  tp.textSize = h * 0.09f
+                  tp.setShadowLayer(10f, 0f, 0f, Color.BLACK)
+                  c.drawText(clockStr, w / 2, h * 0.115f, tp)
+                  tp.clearShadowLayer()
+                  val s = h * 0.032f
+                  drawWifi(c, w / 2 - s * 2.8f, h * 0.15f, s)
+                  drawBattery(c, w / 2 - s * 0.6f, h * 0.165f, s)
+
+                  val cy = circlesY()
+                  val r = cr()
+                  for (i in 0..2) {
+                      val x = circleX(i)
+                      resetP(Paint.Style.FILL)
+                      tp.color = Color.argb(150, 18, 18, 28)
+                      c.drawCircle(x, cy, r, tp)
+                      tp.style = Paint.Style.STROKE
+                      tp.strokeWidth = r * 0.06f
+                      tp.color = Color.argb(210, 255, 255, 255)
+                      c.drawCircle(x, cy, r, tp)
+                      when (i) {
+                          0 -> {
+                              resetP(Paint.Style.FILL)
+                              tp.typeface = Typeface.DEFAULT_BOLD; tp.textAlign = Paint.Align.CENTER; tp.textSize = r * 1.15f
+                              tp.color = Color.parseColor("#4285F4")
+                              c.drawText("G", x, cy + r * 0.4f, tp)
+                          }
+                          1 -> {
+                              resetP(Paint.Style.FILL)
+                              val a = r * 0.42f
+                              val cols = intArrayOf(Color.parseColor("#34A853"), Color.parseColor("#4285F4"), Color.parseColor("#EA4335"))
+                              val px = floatArrayOf(x - a * 0.8f, cy - a, x - a * 0.8f, cy + a, x + a * 1.1f, cy)
+                              val mx = (px[0] + px[2] + px[4]) / 3f
+                              val my = (px[1] + px[3] + px[5]) / 3f
+                              for (k in 0..2) {
+                                  val j = (k + 1) % 3
+                                  path.reset(); path.moveTo(mx, my); path.lineTo(px[k * 2], px[k * 2 + 1]); path.lineTo(px[j * 2], px[j * 2 + 1]); path.close()
+                                  tp.color = cols[k]
+                                  c.drawPath(path, tp)
+                              }
+                          }
+                          else -> {
+                              drawSound(c, x, cy, r)
+                              resetP(Paint.Style.FILL)
+                              tp.color = Color.argb(200, 255, 255, 255); tp.textAlign = Paint.Align.CENTER; tp.textSize = r * 0.3f
+                              c.drawText(if (ringer == 2) "SOM" else if (ringer == 1) "VIBRAR" else "SILÊNCIO", x, cy + r * 1.5f, tp)
+                          }
+                      }
+                  }
+                  drawGear(c, w / 2, h * 0.955f, h * 0.032f)
+                  if (showArrows) {
+                      drawChevron(c, w * 0.03f, h * 0.5f, h * 0.035f, 1)
+                      drawChevron(c, w * 0.97f, h * 0.5f, h * 0.035f, -1)
+                  }
+              }
+
+              private fun hudAt(x: Float, y: Float): String? {
+                  val r = cr() * 1.25f
+                  val cy = circlesY()
+                  val names = arrayOf("google", "play", "sound")
+                  for (i in 0..2) if (hypot(x - circleX(i), y - cy) <= r) return names[i]
+                  if (hypot(x - width / 2f, y - height * 0.955f) <= height * 0.06f) return "gear"
+                  if (showArrows && abs(y - height * 0.5f) < height * 0.18f) {
+                      if (x < width * 0.075f) return "prev"
+                      if (x > width * 0.925f) return "next"
+                  }
+                  return null
+              }
+
+              // ---------------------------------------------------------------- toque
+              private fun widgetAt(x: Float, y: Float): Widget? {
+                  if (!Prefs.bool("widgets_on", false)) return null
+                  for (i in widgets.indices.reversed()) if (widgets[i].rect.contains(x, y)) return widgets[i]
+                  return null
+              }
+
+              private fun itemAt(x: Float, y: Float): AppItem? {
+                  var best: AppItem? = null
+                  var bd = Float.MAX_VALUE
+                  for (l in arrayOf(games, apps)) for (it0 in l) {
+                      if (it0.a < 0.3f || it0.s < 0.3f) continue
+                      val r = max(it0.r * it0.s, 22 * dn)
+                      val d = hypot(x - it0.x, y - it0.y)
+                      if (d <= r && d < bd) { best = it0; bd = d }
+                  }
+                  return best
+              }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  val x = e.x
+                  val y = e.y
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> {
+                          downX = x; downY = y; lastY = y; lastT = e.eventTime
+                          moved = false; longFired = false; touching = true
+                          downHud = hudAt(x, y)
+                          downWidget = if (downHud == null) widgetAt(x, y) else null
+                          downItem = if (downHud == null && downWidget == null) itemAt(x, y) else null
+                          val mw = moveWidget
+                          if (mw != null) { offX = x - mw.rect.left; offY = y - mw.rect.top }
+                          env.down(x, y)
+                          if (mw == null && (downItem != null || downWidget != null)) postDelayed(longRun, 520)
+                          kick()
+                      }
+                      MotionEvent.ACTION_MOVE -> {
+                          if (!moved && hypot(x - downX, y - downY) > 10 * dn) { moved = true; removeCallbacks(longRun) }
+                          val mw = moveWidget
+                          if (mw != null) {
+                              mw.fx = ((x - offX) / width).coerceIn(0f, 0.95f)
+                              mw.fy = ((y - offY) / height).coerceIn(0f, 0.95f)
+                              invalidate()
+                          } else if (moved) {
+                              env.drag(y - lastY, (e.eventTime - lastT) / 1000f)
+                          }
+                          lastY = y; lastT = e.eventTime
+                      }
+                      MotionEvent.ACTION_UP -> {
+                          removeCallbacks(longRun)
+                          touching = false
+                          if (moveWidget != null) {
+                              moveWidget = null
+                              onWidgetMoved()
+                          } else if (!moved && !longFired) {
+                              val hd = downHud
+                              val wd = downWidget
+                              val it0 = downItem
+                              if (hd != null) { if (hudAt(x, y) == hd) onHud(hd) }
+                              else if (wd != null) onWidget(wd, false)
+                              else if (it0 != null) onOpen(it0)
+                              else env.tap(x, y)
+                          }
+                          env.up()
+                          kick()
+                      }
+                      MotionEvent.ACTION_CANCEL -> {
+                          removeCallbacks(longRun)
+                          touching = false
+                          env.up()
+                      }
+                  }
+                  return true
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/horizonlauncher/SettingsActivity.kt <<'EOF'
+          package com.horizonlauncher
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.app.AppOpsManager
+          import android.app.NotificationManager
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.Process
+          import android.provider.OpenableColumns
+          import android.provider.Settings
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.RadioButton
+          import android.widget.RadioGroup
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.Switch
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.io.File
+          import java.io.FileOutputStream
+
+          private const val PROMPT = """Crie um wallpaper para o meu launcher Android HORIZONTAL (landscape).
+
+          O QUE EU QUERO: [DESCREVA AQUI O QUE VOCÊ QUER]
+
+          REGRAS:
+          - Formato horizontal 20:9, resolução 2400x1080 px (ou 16:9, 1920x1080).
+          - O topo terá um relógio grande e o meio terá três círculos; deixe a região central mais calma e com bom contraste.
+          - As laterais esquerda e direita terão listas de ícones; evite detalhes muito claros ou poluídos nelas.
+          - Se for imagem: entregue em PNG ou JPG. Se for animado: GIF ou WebP animado de até 10 segundos em loop perfeito, ou vídeo MP4 (H.264, sem som, de 10 a 20 segundos, com loop sem emenda visível).
+          - Estilo: [DESCREVA O ESTILO: minimalista, neon, realista, anime, etc.]
+          - Cores principais: [CORES]
+          - Sem texto, sem logotipos e sem marca d'água.
+
+          Depois eu vou salvar o arquivo no celular e importar no meu launcher."""
+
+          class SettingsActivity : Activity() {
+              private lateinit var col: LinearLayout
+              private lateinit var wList: LinearLayout
+              private lateinit var permUsage: TextView
+              private lateinit var permDnd: TextView
+
+              private fun dp(x: Int) = (x * resources.displayMetrics.density).toInt()
+
+              private fun LinearLayout.add(v: View, top: Int = 8) {
+                  addView(v, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                      .apply { topMargin = dp(top) })
+              }
+
+              private fun txt(s: String, size: Float = 0f, bold: Boolean = false) = TextView(this).apply {
+                  text = s
+                  if (size > 0f) textSize = size
+                  if (bold) setTypeface(typeface, Typeface.BOLD)
+              }
+
+              private fun head(s: String) = col.add(txt(s, 20f, true), 24)
+
+              private fun btn(s: String, onClick: () -> Unit) = Button(this).apply {
+                  text = s
+                  minHeight = dp(48)
+                  setOnClickListener { onClick() }
+              }
+
+              private fun tog(label: String, key: String, def: Boolean) = Switch(this).apply {
+                  text = label
+                  isChecked = Prefs.bool(key, def)
+                  minHeight = dp(48)
+                  setOnCheckedChangeListener { _, c -> Prefs.putBool(key, c) }
+              }
+
+              private fun sld(name: String, key: String, lo: Int, hi: Int, def: Int, unit: String): LinearLayout {
+                  val box = LinearLayout(this)
+                  box.orientation = LinearLayout.VERTICAL
+                  val v = Prefs.int(key, def)
+                  val t = txt("$name: $v$unit")
+                  val s = SeekBar(this)
+                  s.min = lo
+                  s.max = hi
+                  s.progress = v
+                  s.contentDescription = name
+                  s.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                          t.text = "$name: $p$unit"
+                          if (fromUser) Prefs.putInt(key, p)
+                      }
+                      override fun onStartTrackingTouch(sb: SeekBar?) {}
+                      override fun onStopTrackingTouch(sb: SeekBar?) {}
+                  })
+                  box.addView(t)
+                  box.addView(s)
+                  return box
+              }
+
+              private fun cyc(title: String, key: String, names: List<String>): Button {
+                  val b = btn("") {}
+                  val show = { b.text = title + ": " + names[Prefs.int(key, 0).coerceIn(0, names.size - 1)] }
+                  show()
+                  b.setOnClickListener {
+                      Prefs.putInt(key, (Prefs.int(key, 0) + 1) % names.size)
+                      show()
+                  }
+                  return b
+              }
+
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
+
+              private fun pick(code: Int, mime: String) {
+                  val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                  i.addCategory(Intent.CATEGORY_OPENABLE)
+                  if (mime == "wall") {
+                      i.type = "*/*"
+                      i.putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("image/*", "video/*"))
+                  } else {
+                      i.type = mime
+                  }
+                  @Suppress("DEPRECATION")
+                  startActivityForResult(i, code)
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  Prefs.init(this)
+                  col = LinearLayout(this)
+                  col.orientation = LinearLayout.VERTICAL
+                  col.setPadding(dp(20), dp(16), dp(20), dp(48))
+                  val scroll = ScrollView(this)
+                  scroll.addView(col)
+                  setContentView(scroll)
+
+                  col.add(txt("Configurações", 26f, true))
+                  col.add(btn("Voltar ao launcher") { finish() })
+
+                  head("Ambiente")
+                  val names = arrayOf("SISTEMA", "TERRA 🌍", "BURACO NEGRO 🕳️", "MAR 🌊", "RP 🏠", "WALLPAPER 🖼️")
+                  val rg = RadioGroup(this)
+                  for (i in names.indices) {
+                      val rb = RadioButton(this)
+                      rb.id = 100 + i
+                      rb.text = names[i]
+                      rb.minHeight = dp(48)
+                      rg.addView(rb)
+                  }
+                  rg.check(100 + Prefs.int("mode", 0).coerceIn(0, 5))
+                  rg.setOnCheckedChangeListener { _, id -> Prefs.putInt("mode", id - 100) }
+                  col.add(rg)
+                  col.add(txt("Terra: órbitas e impacto. Buraco negro: atração e reorganização. Mar: apps flutuando. RP: casa com vida. Wallpaper: seu arquivo. Sistema: fundo liso. As setas ‹ › da tela inicial também trocam de ambiente, com uma transição diferente para cada um."))
+
+                  head("Sistema: cor do fundo")
+                  val presets = listOf("Preto" to "#000000", "Cinza escuro" to "#1C1C22", "Azul-marinho" to "#0A1630",
+                      "Roxo escuro" to "#1B1033", "Verde escuro" to "#0B2A1E", "Vinho" to "#2A0E16")
+                  for ((n, hx) in presets) col.add(btn("Fundo: $n") { Prefs.putInt("bg_color", Color.parseColor(hx)); toast("Cor aplicada.") })
+                  val hex = EditText(this)
+                  hex.hint = "Cor personalizada, ex: #112233"
+                  hex.setSingleLine()
+                  col.add(hex)
+                  col.add(btn("Aplicar cor personalizada") {
+                      try {
+                          val s = hex.text.toString().trim().removePrefix("#")
+                          Prefs.putInt("bg_color", Color.parseColor("#$s"))
+                          toast("Cor aplicada.")
+                      } catch (_: Exception) { toast("Cor inválida. Use o formato #RRGGBB.") }
+                  })
+
+                  head("Wallpaper")
+                  col.add(txt("Importe uma imagem, GIF, WebP animado ou vídeo. Depois escolha o ambiente WALLPAPER."))
+                  col.add(btn("Importar wallpaper (imagem, GIF ou vídeo)") { pick(210, "wall") })
+                  col.add(btn("Remover wallpaper") {
+                      File(filesDir, "wall.bin").delete()
+                      Prefs.putStr("wall_kind", "")
+                      Prefs.putInt("wall_ver", Prefs.int("wall_ver", 0) + 1)
+                      toast("Wallpaper removido.")
+                  })
+                  col.add(cyc("Animação do wallpaper", "wall_anim", listOf("Sempre animar", "Parar com bateria baixa (20%)", "Só o primeiro quadro")))
+                  col.add(txt("Prompt-modelo para pedir um wallpaper a outra IA (Gemini, Claude, etc.). Copie, cole lá e troque o que está entre colchetes:"))
+                  col.add(txt(PROMPT))
+                  col.add(btn("Copiar o prompt") {
+                      val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                      cm.setPrimaryClip(ClipData.newPlainText("prompt", PROMPT))
+                      toast("Prompt copiado.")
+                  })
+
+                  head("Apps e jogos")
+                  col.add(cyc("Apresentação", "present", listOf("Carrossel", "Lista")))
+                  col.add(cyc("Ordem", "order_mode", listOf("Manual (segure um app e mova)", "A a Z", "Mais usados (precisa do acesso ao uso)")))
+                  col.add(sld("Tamanho dos ícones", "icon_dp", 36, 96, 56, " dp"))
+                  col.add(btn("Restaurar apps e jogos ocultos") { restoreHidden() })
+                  col.add(btn("Desfazer movimentos entre JOGOS e APP") {
+                      Prefs.putStrs("force_games", emptySet()); Prefs.putStrs("force_apps", emptySet())
+                      Prefs.putStr("order_games", ""); Prefs.putStr("order_apps", "")
+                      toast("Organização restaurada.")
+                  })
+                  col.add(txt("Na tela inicial, segure um app para esconder, mover de lado ou levar para o início."))
+
+                  head("Animações")
+                  col.add(cyc("Animações", "anim", listOf("Completas", "Economia de bateria", "Desligadas")))
+                  col.add(tog("Transições entre ambientes", "trans_on", true))
+                  col.add(sld("Mar: velocidade", "sea_speed", 1, 100, 50, ""))
+                  col.add(cyc("Mar: áreas", "sea_split", listOf("Jogos à esquerda, apps à direita", "Jogos em cima, apps embaixo")))
+
+                  head("Widgets (opcional)")
+                  col.add(tog("Mostrar widgets na tela inicial", "widgets_on", false))
+                  col.add(btn("Adicionar GIF") { pick(201, "image/*") })
+                  col.add(btn("Adicionar foto") { pick(202, "image/*") })
+                  col.add(btn("Adicionar vídeo") { pick(203, "video/*") })
+                  col.add(btn("Adicionar som") { pick(204, "audio/*") })
+                  col.add(btn("Adicionar link") { addLink() })
+                  col.add(txt("Segure um widget na tela inicial para mover, mudar o tamanho, configurar ou remover."))
+                  wList = LinearLayout(this)
+                  wList.orientation = LinearLayout.VERTICAL
+                  col.add(wList)
+
+                  head("Pesquisa e setas")
+                  col.add(tog("Barra de pesquisa do Google", "search_on", false))
+                  col.add(tog("Setas laterais (trocam de ambiente)", "arrows_on", true))
+
+                  head("Launcher padrão e permissões")
+                  col.add(btn("Definir como launcher padrão") {
+                      try { startActivity(Intent(Settings.ACTION_HOME_SETTINGS)) } catch (_: Exception) { toast("Abra Ajustes > Apps > Apps padrão > Tela inicial.") }
+                  })
+                  permUsage = txt("")
+                  col.add(permUsage)
+                  col.add(btn("Acesso ao uso (opcional: RP e ordem por mais usados)") { startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)) })
+                  permDnd = txt("")
+                  col.add(permDnd)
+                  col.add(btn("Acesso ao Não perturbe (opcional: modo silencioso)") {
+                      try { startActivity(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS)) } catch (_: Exception) { }
+                  })
+                  col.add(txt("O launcher não pede nenhuma outra permissão."))
+
+                  head("Tudo")
+                  col.add(btn("Restaurar TODAS as configurações") {
+                      AlertDialog.Builder(this).setTitle("Restaurar tudo?").setMessage("Apaga ambiente, cores, ocultos e organização.")
+                          .setPositiveButton("Restaurar") { _, _ -> Prefs.resetAll(); recreate() }
+                          .setNegativeButton("Cancelar", null).show()
+                  })
+                  refreshWidgets()
+              }
+
+              @Suppress("DEPRECATION")
+              private fun usageOn(): Boolean = try {
+                  val ops = getSystemService(APP_OPS_SERVICE) as AppOpsManager
+                  ops.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), packageName) == AppOpsManager.MODE_ALLOWED
+              } catch (_: Exception) { false }
+
+              override fun onResume() {
+                  super.onResume()
+                  permUsage.text = (if (usageOn()) "✔ " else "✖ ") + "Acesso ao uso"
+                  val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                  permDnd.text = (if (nm.isNotificationPolicyAccessGranted) "✔ " else "✖ ") + "Acesso ao Não perturbe"
+              }
+
+              private fun restoreHidden() {
+                  Thread {
+                      val pm = packageManager
+                      val hidden = Prefs.strs("hidden")
+                      val list = ArrayList<Pair<String, String>>()
+                      val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                      for (ri in pm.queryIntentActivities(intent, 0)) {
+                          val p = ri.activityInfo.packageName
+                          if (hidden.contains(p) && list.none { it.first == p }) list.add(Pair(p, ri.loadLabel(pm).toString()))
+                      }
+                      runOnUiThread {
+                          if (list.isEmpty()) {
+                              toast("Nenhum app oculto.")
+                          } else {
+                              val labels = list.map { it.second }.toTypedArray()
+                              val checked = BooleanArray(list.size)
+                              AlertDialog.Builder(this).setTitle("Restaurar quais?")
+                                  .setMultiChoiceItems(labels, checked) { _, i, c -> checked[i] = c }
+                                  .setPositiveButton("Restaurar") { _, _ ->
+                                      var h = Prefs.strs("hidden")
+                                      for (i in list.indices) if (checked[i]) h = h - list[i].first
+                                      Prefs.putStrs("hidden", h)
+                                      toast("Restaurado.")
+                                  }.setNegativeButton("Cancelar", null).show()
+                          }
+                      }
+                  }.start()
+              }
+
+              // ---------------------------------------------------------------- widgets
+              private fun refreshWidgets() {
+                  wList.removeAllViews()
+                  for (w in Store.loadWidgets()) {
+                      wList.add(btn("Remover: " + (w.title.ifEmpty { w.type }) + " (" + w.type + ")") {
+                          val all = Store.loadWidgets()
+                          all.removeAll { it.id == w.id }
+                          File(filesDir, "w_" + w.id).delete()
+                          Store.saveWidgets(all)
+                          refreshWidgets()
+                      }, 4)
+                  }
+              }
+
+              private fun addLink() {
+                  val box = LinearLayout(this)
+                  box.orientation = LinearLayout.VERTICAL
+                  box.setPadding(dp(20), dp(8), dp(20), 0)
+                  val t = EditText(this); t.hint = "Título"
+                  val u = EditText(this); u.hint = "Endereço (ex: youtube.com)"
+                  box.addView(t); box.addView(u)
+                  AlertDialog.Builder(this).setTitle("Novo link").setView(box)
+                      .setPositiveButton("Adicionar") { _, _ ->
+                          val s = u.text.toString().trim()
+                          if (s.isNotEmpty()) newWidget("link", t.text.toString().trim(), if (s.startsWith("http")) s else "https://$s")
+                      }.setNegativeButton("Cancelar", null).show()
+              }
+
+              private fun newWidget(type: String, title: String, data: String): Widget {
+                  val all = Store.loadWidgets()
+                  val n = all.size % 4
+                  val w = Widget(System.currentTimeMillis().toString(), type, title, data, 0.32f + 0.05f * n, 0.26f + 0.07f * n, 0.22f)
+                  all.add(w)
+                  Store.saveWidgets(all)
+                  Prefs.putBool("widgets_on", true)
+                  refreshWidgets()
+                  return w
+              }
+
+              private fun copy(uri: Uri, dst: File): Boolean = try {
+                  contentResolver.openInputStream(uri)?.use { i -> FileOutputStream(dst).use { o -> i.copyTo(o) } }
+                  true
+              } catch (_: Exception) { false }
+
+              private fun nameOf(u: Uri): String {
+                  contentResolver.query(u, null, null, null, null)?.use { c ->
+                      val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                      if (i >= 0 && c.moveToFirst()) return c.getString(i)
+                  }
+                  return ""
+              }
+
+              @Suppress("DEPRECATION")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (resultCode != RESULT_OK) return
+                  val uri = data?.data ?: return
+                  if (requestCode == 210) {
+                      val mime = contentResolver.getType(uri) ?: ""
+                      val kind = if (mime.startsWith("video")) "video" else "image"
+                      if (copy(uri, File(filesDir, "wall.bin"))) {
+                          Prefs.putStr("wall_kind", kind)
+                          Prefs.putInt("wall_ver", Prefs.int("wall_ver", 0) + 1)
+                          toast("Wallpaper importado. Escolha o ambiente WALLPAPER.")
+                      } else toast("Não consegui importar esse arquivo.")
+                      return
+                  }
+                  val type = when (requestCode) { 201 -> "gif"; 202 -> "photo"; 203 -> "video"; 204 -> "sound"; else -> return }
+                  val id = System.currentTimeMillis().toString()
+                  if (!copy(uri, File(filesDir, "w_$id"))) { toast("Não consegui importar esse arquivo."); return }
+                  val all = Store.loadWidgets()
+                  val n = all.size % 4
+                  all.add(Widget(id, type, nameOf(uri), "", 0.32f + 0.05f * n, 0.26f + 0.07f * n, 0.22f))
+                  Store.saveWidgets(all)
+                  Prefs.putBool("widgets_on", true)
+                  refreshWidgets()
+                  toast("Widget adicionado. Segure nele na tela inicial para mover.")
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/horizonlauncher/VideoBg.kt <<'EOF'
+          package com.horizonlauncher
+
+          import android.content.Context
+          import android.graphics.Matrix
+          import android.graphics.SurfaceTexture
+          import android.media.MediaPlayer
+          import android.view.Surface
+          import android.view.TextureView
+          import java.io.File
+
+          /** Vídeo de wallpaper: toca em loop, sem som, preenchendo a tela (corta as sobras). */
+          class VideoBg(c: Context) : TextureView(c), TextureView.SurfaceTextureListener {
+              private var mp: MediaPlayer? = null
+              private var file: File? = null
+              private var surface: Surface? = null
+              private var vw = 0
+              private var vh = 0
+              private var wantPlay = true
+
+              init {
+                  surfaceTextureListener = this
+              }
+
+              fun play(f: File) {
+                  file = f
+                  if (isAvailable && surface != null) start()
+              }
+
+              fun clear() {
+                  file = null
+                  release()
+              }
+
+              fun pausePlayback() {
+                  wantPlay = false
+                  try { mp?.pause() } catch (_: Exception) { }
+              }
+
+              fun resumePlayback() {
+                  wantPlay = true
+                  try { mp?.start() } catch (_: Exception) { }
+              }
+
+              private fun start() {
+                  release()
+                  val f = file ?: return
+                  val m = MediaPlayer()
+                  try {
+                      m.setSurface(surface)
+                      m.setDataSource(f.path)
+                      m.isLooping = true
+                      m.setVolume(0f, 0f)
+                      m.setOnVideoSizeChangedListener { _, w, h -> vw = w; vh = h; fit() }
+                      m.setOnPreparedListener { if (wantPlay) it.start() }
+                      m.prepareAsync()
+                      mp = m
+                  } catch (e: Exception) {
+                      m.release()
+                  }
+              }
+
+              private fun release() {
+                  try { mp?.release() } catch (_: Exception) { }
+                  mp = null
+              }
+
+              private fun fit() {
+                  if (vw <= 0 || vh <= 0 || width <= 0 || height <= 0) return
+                  val av = vw.toFloat() / vh
+                  val aw = width.toFloat() / height
+                  val m = Matrix()
+                  val sx = if (av > aw) av / aw else 1f
+                  val sy = if (av > aw) 1f else aw / av
+                  m.setScale(sx, sy, width / 2f, height / 2f)
+                  setTransform(m)
+              }
+
+              override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
+                  surface = Surface(st)
+                  if (file != null) start()
+              }
+
+              override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) { fit() }
+
+              override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                  release()
+                  surface?.release()
+                  surface = null
+                  return true
+              }
+
+              override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+          }
+          EOF
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">Horizon Launcher</string>
+          </resources>
+          EOF
+
+      - name: Compilar
+        run: |
+          gradle assembleDebug --no-daemon --console=plain > build.log 2>&1 || {
+            echo "=== ERROS DE COMPILACAO (me mande um print disto) ==="
+            grep -E "^e: |What went wrong" -A3 build.log | head -80
+            exit 1
+          }
+          echo "Compilou sem erros."
+
+      - name: Guardar o APK como artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizon-launcher-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Publicar o APK em Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "horizon-${{ github.run_number }}" app/build/outputs/apk/debug/app-debug.apk \
+            --title "Horizon Launcher #${{ github.run_number }}" \
+            --notes "Baixe o app-debug.apk e instale. Depois defina como launcher padrão nas configurações."
