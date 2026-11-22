@@ -1,0 +1,821 @@
+# Toque Turbo: botão + mira com auto clique, e contador de Hz da tela.
+# Coloque em .github/workflows/build-turbo.yml. Compila na nuvem e publica o APK em "Releases".
+name: Gerar APK do Toque Turbo
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Criar o projeto Android
+        run: |
+          mkdir -p app app/src/main app/src/main/java/com/toqueturbo app/src/main/res/values app/src/main/res/xml
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "ToqueTurbo"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g
+          kotlin.code.style=official
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.toqueturbo"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.toqueturbo"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@android:drawable/ic_media_play"
+                  android:label="@string/app_name">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <activity android:name=".AppsActivity" android:exported="false" android:label="Escolher apps" />
+
+                  <service
+                      android:name=".TurboService"
+                      android:exported="false"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/toqueturbo/AppsActivity.kt <<'EOF'
+          package com.toqueturbo
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.drawable.Drawable
+          import android.os.Bundle
+          import android.text.Editable
+          import android.text.TextWatcher
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.BaseAdapter
+          import android.widget.CheckBox
+          import android.widget.EditText
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.ListView
+          import android.widget.TextView
+
+          /** Lista os apps instalados; os marcados são onde o botão e a mira aparecem (no modo "só nos apps escolhidos"). */
+          class AppsActivity : Activity() {
+              private class Item(val label: String, val pkg: String, val icon: Drawable)
+              private class Row(val icon: ImageView, val name: TextView, val chk: CheckBox)
+
+              private val all = ArrayList<Item>()
+              private val shown = ArrayList<Item>()
+              private val sel = HashSet<String>()
+              private lateinit var adapter: BaseAdapter
+
+              private fun dp(x: Int) = (x * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  Prefs.init(this)
+                  sel.addAll(Prefs.selected())
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.fitsSystemWindows = true
+                  root.setPadding(dp(12), dp(12), dp(12), 0)
+                  val info = TextView(this)
+                  info.text = "Marque os apps onde o Toque Turbo deve aparecer."
+                  val search = EditText(this)
+                  search.hint = "Buscar app…"
+                  search.setSingleLine()
+                  val list = ListView(this)
+                  root.addView(info)
+                  root.addView(search)
+                  root.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+                  setContentView(root)
+
+                  adapter = object : BaseAdapter() {
+                      override fun getCount() = shown.size
+                      override fun getItem(position: Int): Any = shown[position]
+                      override fun getItemId(position: Int) = position.toLong()
+                      override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                          val row: Row
+                          val v: View
+                          if (convertView == null) {
+                              val box = LinearLayout(this@AppsActivity)
+                              box.orientation = LinearLayout.HORIZONTAL
+                              box.gravity = Gravity.CENTER_VERTICAL
+                              box.setPadding(0, dp(6), 0, dp(6))
+                              val ic = ImageView(this@AppsActivity)
+                              val nm = TextView(this@AppsActivity)
+                              nm.setPadding(dp(12), 0, dp(12), 0)
+                              val ck = CheckBox(this@AppsActivity)
+                              ck.isClickable = false
+                              ck.isFocusable = false
+                              box.addView(ic, LinearLayout.LayoutParams(dp(40), dp(40)))
+                              box.addView(nm, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                              box.addView(ck)
+                              row = Row(ic, nm, ck)
+                              box.tag = row
+                              v = box
+                          } else {
+                              v = convertView
+                              row = convertView.tag as Row
+                          }
+                          val item = shown[position]
+                          row.icon.setImageDrawable(item.icon)
+                          row.name.text = item.label
+                          row.chk.isChecked = sel.contains(item.pkg)
+                          return v
+                      }
+                  }
+                  list.adapter = adapter
+                  list.setOnItemClickListener { _, _, pos, _ ->
+                      val pkg = shown[pos].pkg
+                      if (!sel.add(pkg)) sel.remove(pkg)
+                      Prefs.setSelected(sel)
+                      TurboService.instance?.refresh()
+                      adapter.notifyDataSetChanged()
+                  }
+                  search.addTextChangedListener(object : TextWatcher {
+                      override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
+                      override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) {}
+                      override fun afterTextChanged(s: Editable?) { filter(s?.toString() ?: "") }
+                  })
+
+                  Thread {
+                      val pm = packageManager
+                      val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                      val seen = HashSet<String>()
+                      val tmp = ArrayList<Item>()
+                      for (ri in pm.queryIntentActivities(intent, 0)) {
+                          val p = ri.activityInfo.packageName
+                          if (p == packageName || !seen.add(p)) continue
+                          tmp.add(Item(ri.loadLabel(pm).toString(), p, ri.loadIcon(pm)))
+                      }
+                      tmp.sortBy { it.label.lowercase() }
+                      runOnUiThread {
+                          all.addAll(tmp)
+                          filter(search.text.toString())
+                      }
+                  }.start()
+              }
+
+              private fun filter(q: String) {
+                  shown.clear()
+                  val k = q.trim().lowercase()
+                  for (i in all) if (k.isEmpty() || i.label.lowercase().contains(k)) shown.add(i)
+                  adapter.notifyDataSetChanged()
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/toqueturbo/MainActivity.kt <<'EOF'
+          package com.toqueturbo
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.Switch
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              private lateinit var status: TextView
+              private lateinit var appsBtn: Button
+
+              private fun dp(x: Int) = (x * resources.displayMetrics.density).toInt()
+
+              private fun LinearLayout.add(v: View) {
+                  addView(v, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                      .apply { topMargin = dp(8) })
+              }
+
+              private fun label(s: String, size: Float, bold: Boolean) = TextView(this).apply {
+                  text = s
+                  if (size > 0f) textSize = size
+                  if (bold) setTypeface(typeface, Typeface.BOLD)
+              }
+
+              private fun button(s: String, onClick: () -> Unit) = Button(this).apply {
+                  text = s
+                  minHeight = dp(48)
+                  setOnClickListener { onClick() }
+              }
+
+              private fun toggle(s: String, init: Boolean, on: (Boolean) -> Unit) = Switch(this).apply {
+                  text = s
+                  isChecked = init
+                  minHeight = dp(48)
+                  setOnCheckedChangeListener { _, c -> on(c) }
+              }
+
+              private fun slider(name: String, lo: Int, hi: Int, v: Int, unit: String, on: (Int) -> Unit): LinearLayout {
+                  val box = LinearLayout(this)
+                  box.orientation = LinearLayout.VERTICAL
+                  val t = label("$name: $v$unit", 0f, false)
+                  val s = SeekBar(this)
+                  s.min = lo
+                  s.max = hi
+                  s.progress = v
+                  s.contentDescription = name
+                  s.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                          t.text = "$name: $p$unit"
+                          if (fromUser) on(p)
+                      }
+                      override fun onStartTrackingTouch(sb: SeekBar?) {}
+                      override fun onStopTrackingTouch(sb: SeekBar?) {}
+                  })
+                  box.addView(t)
+                  box.addView(s)
+                  return box
+              }
+
+              private fun upd() {
+                  TurboService.instance?.refresh()
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  Prefs.init(this)
+                  val col = LinearLayout(this)
+                  col.orientation = LinearLayout.VERTICAL
+                  col.setPadding(dp(16), dp(16), dp(16), dp(32))
+                  val scroll = ScrollView(this)
+                  scroll.fitsSystemWindows = true
+                  scroll.addView(col)
+                  setContentView(scroll)
+
+                  col.add(label("Toque Turbo ⚡", 26f, true))
+                  col.add(label("Um botão e uma mira por cima dos apps. Segurando o botão, o app toca na mira várias vezes por segundo.", 0f, false))
+                  status = label("", 0f, true)
+                  col.add(status)
+                  col.add(button("Abrir ajustes de acessibilidade") { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) })
+                  col.add(toggle("Ligado", Prefs.enabled) { Prefs.enabled = it; upd() })
+
+                  col.add(label("Onde aparece", 20f, true))
+                  col.add(toggle("Só nos apps que eu escolher", Prefs.onlySelected) { Prefs.onlySelected = it; upd() })
+                  appsBtn = button("") { startActivity(Intent(this, AppsActivity::class.java)) }
+                  col.add(appsBtn)
+
+                  col.add(label("Auto clique", 20f, true))
+                  col.add(slider("Cliques por segundo", 1, 30, Prefs.cps, "") { Prefs.cps = it })
+                  col.add(toggle("Modo alternar (toque liga, toque desliga) em vez de segurar", Prefs.toggleMode) { Prefs.toggleMode = it; upd() })
+                  col.add(label("Se os cliques não caírem enquanto você segura o botão, use o modo alternar. O Android às vezes cancela toques automáticos quando um dedo está na tela.", 0f, false))
+                  col.add(toggle("Mostrar a mira", Prefs.showTarget) { Prefs.showTarget = it; upd() })
+                  col.add(slider("Tamanho do botão", 40, 200, Prefs.btnSize, " dp") { Prefs.btnSize = it; upd() })
+                  col.add(slider("Transparência do botão", 10, 100, Prefs.btnAlpha, "%") { Prefs.btnAlpha = it; upd() })
+                  col.add(slider("Tamanho da mira", 20, 150, Prefs.tgtSize, " dp") { Prefs.tgtSize = it; upd() })
+                  col.add(slider("Transparência da mira", 10, 100, Prefs.tgtAlpha, "%") { Prefs.tgtAlpha = it; upd() })
+
+                  col.add(label("Contador", 20f, true))
+                  col.add(toggle("Mostrar a taxa da tela (Hz)", Prefs.fpsOn) { Prefs.fpsOn = it; upd() })
+                  col.add(label("Isto mostra quantas vezes por segundo a tela atualiza, não o FPS de dentro do jogo. O Android não deixa um app comum ler o FPS de outro.", 0f, false))
+
+                  col.add(label("Posição", 20f, true))
+                  col.add(toggle("Modo de edição (arraste o botão, a mira e o contador)", Prefs.editing) { Prefs.editing = it; upd() })
+                  col.add(label("Desligue o modo de edição quando terminar, senão o botão não liga o auto clique. Em jogo deitado, a posição é salva separada da posição em pé.", 0f, false))
+                  col.add(button("Voltar tudo pra posição inicial") { Prefs.resetPositions(); upd() })
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  val s = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: ""
+                  status.text = if (s.contains(packageName) && s.contains("TurboService")) "Serviço: ATIVO ✔"
+                  else "Serviço: DESATIVADO. Abra os ajustes de acessibilidade e ligue o Toque Turbo."
+                  appsBtn.text = "Escolher apps (" + Prefs.selected().size + " escolhidos)"
+                  TurboService.instance?.setForeground(packageName)
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/toqueturbo/Prefs.kt <<'EOF'
+          package com.toqueturbo
+
+          import android.content.Context
+          import android.content.SharedPreferences
+
+          /** Configurações salvas no aparelho. */
+          object Prefs {
+              private lateinit var sp: SharedPreferences
+
+              fun init(c: Context) {
+                  if (!::sp.isInitialized) sp = c.applicationContext.getSharedPreferences("turbo", Context.MODE_PRIVATE)
+              }
+
+              fun getInt(k: String, d: Int): Int = sp.getInt(k, d)
+              fun setInt(k: String, v: Int) = sp.edit().putInt(k, v).apply()
+              private fun bool(k: String, d: Boolean) = sp.getBoolean(k, d)
+              private fun putBool(k: String, v: Boolean) = sp.edit().putBoolean(k, v).apply()
+
+              var enabled: Boolean
+                  get() = bool("enabled", true)
+                  set(v) = putBool("enabled", v)
+              var onlySelected: Boolean
+                  get() = bool("only", false)
+                  set(v) = putBool("only", v)
+              var editing: Boolean
+                  get() = bool("editing", false)
+                  set(v) = putBool("editing", v)
+              var toggleMode: Boolean
+                  get() = bool("toggle", false)
+                  set(v) = putBool("toggle", v)
+              var showTarget: Boolean
+                  get() = bool("showtarget", true)
+                  set(v) = putBool("showtarget", v)
+              var fpsOn: Boolean
+                  get() = bool("fps", false)
+                  set(v) = putBool("fps", v)
+              var cps: Int
+                  get() = getInt("cps", 4)
+                  set(v) = setInt("cps", v)
+              var btnSize: Int
+                  get() = getInt("btnsize", 80)
+                  set(v) = setInt("btnsize", v)
+              var btnAlpha: Int
+                  get() = getInt("btnalpha", 70)
+                  set(v) = setInt("btnalpha", v)
+              var tgtSize: Int
+                  get() = getInt("tgtsize", 56)
+                  set(v) = setInt("tgtsize", v)
+              var tgtAlpha: Int
+                  get() = getInt("tgtalpha", 80)
+                  set(v) = setInt("tgtalpha", v)
+
+              fun selected(): Set<String> = sp.getStringSet("sel", emptySet()) ?: emptySet()
+              fun setSelected(s: Set<String>) = sp.edit().putStringSet("sel", HashSet(s)).apply()
+
+              /** Apaga as posições salvas (botão, mira e contador, em pé e deitado). */
+              fun resetPositions() {
+                  val e = sp.edit()
+                  val rx = Regex("^[btf][xy]_[lp]$")
+                  for (k in sp.all.keys) if (rx.matches(k)) e.remove(k)
+                  e.apply()
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/toqueturbo/TurboService.kt <<'EOF'
+          package com.toqueturbo
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.res.Configuration
+          import android.graphics.Color
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Choreographer
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.WindowManager.LayoutParams as LP
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.inputmethod.InputMethodManager
+          import android.widget.TextView
+
+          /**
+           * Como funciona:
+           *  - BOTÃO (touchable) e MIRA (não touchable, os toques atravessam) ficam por cima dos apps escolhidos.
+           *  - Enquanto você SEGURA o botão (ou liga no modo alternar), o serviço manda toques na posição da mira
+           *    várias vezes por segundo usando dispatchGesture (precisa do serviço de acessibilidade).
+           *  - O contador mostra a taxa de atualização da TELA em Hz (o Android não entrega o FPS de outros apps).
+           */
+          class TurboService : AccessibilityService() {
+              companion object {
+                  var instance: TurboService? = null
+                  private val FLAGS = LP.FLAG_NOT_FOCUSABLE or LP.FLAG_LAYOUT_IN_SCREEN or LP.FLAG_LAYOUT_NO_LIMITS
+              }
+
+              private val ui = Handler(Looper.getMainLooper())
+              private var wm: WindowManager? = null
+              private var fg: String? = null
+              private val ignore = HashSet<String>()
+              private var ready = false
+              private var spamming = false
+              private var fpsRunning = false
+
+              private lateinit var trig: TriggerView
+              private lateinit var tgt: TargetView
+              private lateinit var fpsV: TextView
+              private lateinit var trigLp: LP
+              private lateinit var tgtLp: LP
+              private lateinit var fpsLp: LP
+
+              private val spamRun = object : Runnable {
+                  override fun run() {
+                      if (!spamming) return
+                      tapTarget()
+                      ui.postDelayed(this, maxOf(25L, 1000L / Prefs.cps))
+                  }
+              }
+
+              private val frame = object : Choreographer.FrameCallback {
+                  var n = 0
+                  var t0 = 0L
+                  override fun doFrame(frameTimeNanos: Long) {
+                      if (!fpsRunning) return
+                      if (t0 == 0L) t0 = frameTimeNanos
+                      n++
+                      val dt = frameTimeNanos - t0
+                      if (dt >= 500_000_000L) {
+                          fpsV.text = "tela " + Math.round(n * 1e9 / dt) + " Hz"
+                          n = 0
+                          t0 = frameTimeNanos
+                      }
+                      Choreographer.getInstance().postFrameCallback(this)
+                  }
+              }
+
+              private val control = View.OnTouchListener { _, e ->
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> if (!Prefs.toggleMode) startSpam()
+                      MotionEvent.ACTION_UP -> if (Prefs.toggleMode) { if (spamming) stopSpam() else startSpam() } else stopSpam()
+                      MotionEvent.ACTION_CANCEL -> if (!Prefs.toggleMode) stopSpam()
+                  }
+                  true
+              }
+
+              private fun baseLp(): LP {
+                  val l = LP(LP.WRAP_CONTENT, LP.WRAP_CONTENT, LP.TYPE_ACCESSIBILITY_OVERLAY, FLAGS, PixelFormat.TRANSLUCENT)
+                  l.gravity = Gravity.TOP or Gravity.START
+                  if (Build.VERSION.SDK_INT >= 28) l.layoutInDisplayCutoutMode = LP.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                  return l
+              }
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  Prefs.init(this)
+                  instance = this
+                  val m = getSystemService(WINDOW_SERVICE) as WindowManager
+                  wm = m
+                  try {
+                      val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
+                      imm.enabledInputMethodList.forEach { ignore.add(it.packageName) }
+                  } catch (_: Exception) { }
+                  ignore.add("com.android.systemui")
+                  ignore.add("android")
+                  ignore.add(packageName)
+
+                  tgt = TargetView(this)
+                  tgtLp = baseLp()
+                  m.addView(tgt, tgtLp)
+                  trig = TriggerView(this)
+                  trigLp = baseLp()
+                  m.addView(trig, trigLp)
+                  fpsV = TextView(this)
+                  fpsV.setTextColor(Color.WHITE)
+                  fpsV.textSize = 14f
+                  fpsV.typeface = Typeface.MONOSPACE
+                  fpsV.gravity = Gravity.CENTER
+                  fpsV.text = "tela … Hz"
+                  fpsV.background = GradientDrawable().apply { cornerRadius = 40f; setColor(Color.argb(170, 0, 0, 0)) }
+                  fpsLp = baseLp()
+                  m.addView(fpsV, fpsLp)
+                  ready = true
+                  refresh()
+              }
+
+              private fun orient() = if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) "_l" else "_p"
+
+              private fun place(v: View, lp: LP, w: Int, h: Int, key: String, defX: Int, defY: Int, touchable: Boolean) {
+                  val d = resources.displayMetrics
+                  val sfx = orient()
+                  lp.width = w
+                  lp.height = h
+                  lp.x = Prefs.getInt(key + "x" + sfx, defX).coerceIn(0, maxOf(0, d.widthPixels - w))
+                  lp.y = Prefs.getInt(key + "y" + sfx, defY).coerceIn(0, maxOf(0, d.heightPixels - h))
+                  lp.flags = FLAGS or (if (touchable) 0 else LP.FLAG_NOT_TOUCHABLE)
+                  try { wm?.updateViewLayout(v, lp) } catch (_: Exception) { }
+              }
+
+              /** Relê as configurações e reposiciona tudo. */
+              fun refresh() {
+                  if (!ready) return
+                  val d = resources.displayMetrics
+                  val dn = d.density
+                  val edit = Prefs.editing
+                  val bs = (Prefs.btnSize * dn).toInt()
+                  val ts = (Prefs.tgtSize * dn).toInt()
+                  val m24 = (24 * dn).toInt()
+                  place(trig, trigLp, bs, bs, "b", m24, d.heightPixels - bs - m24, true)
+                  place(tgt, tgtLp, ts, ts, "t", (d.widthPixels - ts) / 2, (d.heightPixels - ts) / 2, edit)
+                  place(fpsV, fpsLp, (120 * dn).toInt(), (36 * dn).toInt(), "f", (12 * dn).toInt(), (40 * dn).toInt(), edit)
+                  trig.alpha = Prefs.btnAlpha / 100f
+                  tgt.alpha = Prefs.tgtAlpha / 100f
+                  trig.editing = edit
+                  tgt.editing = edit
+                  trig.setOnTouchListener(if (edit) dragger(trig, trigLp, "b") else control)
+                  tgt.setOnTouchListener(if (edit) dragger(tgt, tgtLp, "t") else null)
+                  fpsV.setOnTouchListener(if (edit) dragger(fpsV, fpsLp, "f") else null)
+                  if (edit) stopSpam()
+                  updateVisibility()
+                  trig.invalidate()
+                  tgt.invalidate()
+              }
+
+              private fun dragger(v: View, lp: LP, key: String): View.OnTouchListener {
+                  var lx = 0f
+                  var ly = 0f
+                  return View.OnTouchListener { _, e ->
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> { lx = e.rawX; ly = e.rawY }
+                          MotionEvent.ACTION_MOVE -> {
+                              val d = resources.displayMetrics
+                              lp.x = (lp.x + (e.rawX - lx)).toInt().coerceIn(0, maxOf(0, d.widthPixels - lp.width))
+                              lp.y = (lp.y + (e.rawY - ly)).toInt().coerceIn(0, maxOf(0, d.heightPixels - lp.height))
+                              lx = e.rawX
+                              ly = e.rawY
+                              try { wm?.updateViewLayout(v, lp) } catch (_: Exception) { }
+                          }
+                          MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                              Prefs.setInt(key + "x" + orient(), lp.x)
+                              Prefs.setInt(key + "y" + orient(), lp.y)
+                          }
+                      }
+                      true
+                  }
+              }
+
+              private fun visible(): Boolean {
+                  if (!Prefs.enabled) return false
+                  if (Prefs.editing || !Prefs.onlySelected) return true
+                  val f = fg ?: return false
+                  return f == packageName || Prefs.selected().contains(f)
+              }
+
+              private fun updateVisibility() {
+                  if (!ready) return
+                  val v = visible()
+                  trig.visibility = if (v) View.VISIBLE else View.GONE
+                  tgt.visibility = if (v && (Prefs.showTarget || Prefs.editing)) View.VISIBLE else View.GONE
+                  fpsV.visibility = if (v && Prefs.fpsOn) View.VISIBLE else View.GONE
+                  if (!v) stopSpam()
+                  if (v && Prefs.fpsOn) fpsStart() else fpsStop()
+              }
+
+              /** A tela do próprio app avisa que está na frente (o serviço ignora os eventos do próprio pacote). */
+              fun setForeground(pkg: String) {
+                  fg = pkg
+                  updateVisibility()
+              }
+
+              private fun startSpam() {
+                  if (spamming) return
+                  spamming = true
+                  trig.active = true
+                  trig.invalidate()
+                  ui.post(spamRun)
+              }
+
+              private fun stopSpam() {
+                  spamming = false
+                  ui.removeCallbacks(spamRun)
+                  if (ready) {
+                      trig.active = false
+                      trig.invalidate()
+                  }
+              }
+
+              private fun tapTarget() {
+                  val x = (tgtLp.x + tgtLp.width / 2).toFloat()
+                  val y = (tgtLp.y + tgtLp.height / 2).toFloat()
+                  val path = Path()
+                  path.moveTo(x, y)
+                  val g = GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(path, 0L, 20L)).build()
+                  dispatchGesture(g, null, null)
+              }
+
+              private fun fpsStart() {
+                  if (fpsRunning) return
+                  fpsRunning = true
+                  frame.n = 0
+                  frame.t0 = 0L
+                  Choreographer.getInstance().postFrameCallback(frame)
+              }
+
+              private fun fpsStop() {
+                  fpsRunning = false
+                  Choreographer.getInstance().removeFrameCallback(frame)
+              }
+
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {
+                  if (e == null || e.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+                  val p = e.packageName?.toString() ?: return
+                  if (p in ignore) return
+                  fg = p
+                  updateVisibility()
+              }
+
+              override fun onConfigurationChanged(newConfig: Configuration) {
+                  super.onConfigurationChanged(newConfig)
+                  ui.post { refresh() }
+              }
+
+              override fun onInterrupt() {
+                  stopSpam()
+              }
+
+              override fun onDestroy() {
+                  instance = null
+                  stopSpam()
+                  fpsStop()
+                  ui.removeCallbacksAndMessages(null)
+                  if (ready) {
+                      try { wm?.removeView(trig) } catch (_: Exception) { }
+                      try { wm?.removeView(tgt) } catch (_: Exception) { }
+                      try { wm?.removeView(fpsV) } catch (_: Exception) { }
+                  }
+                  super.onDestroy()
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/toqueturbo/Views.kt <<'EOF'
+          package com.toqueturbo
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.DashPathEffect
+          import android.graphics.Paint
+          import android.view.View
+
+          /** Botão redondo: segure (ou toque) pra ligar o auto clique. */
+          class TriggerView(c: Context) : View(c) {
+              var active = false
+              var editing = false
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+
+              override fun onDraw(cv: Canvas) {
+                  val w = width.toFloat()
+                  val r = w / 2
+                  p.style = Paint.Style.FILL
+                  p.color = Color.parseColor(if (active) "#2FC25B" else "#6D4AFF")
+                  cv.drawCircle(r, r, r - 4f, p)
+                  p.style = Paint.Style.STROKE
+                  p.strokeWidth = w * 0.06f
+                  p.color = Color.WHITE
+                  cv.drawCircle(r, r, r - 4f - p.strokeWidth / 2, p)
+                  p.style = Paint.Style.FILL
+                  p.textAlign = Paint.Align.CENTER
+                  p.textSize = w * 0.42f
+                  cv.drawText("⚡", r, r + p.textSize * 0.35f, p)
+                  if (editing) {
+                      p.style = Paint.Style.STROKE
+                      p.strokeWidth = 4f
+                      p.color = Color.parseColor("#FFD400")
+                      p.pathEffect = DashPathEffect(floatArrayOf(14f, 10f), 0f)
+                      cv.drawCircle(r, r, r - 2f, p)
+                      p.pathEffect = null
+                  }
+              }
+          }
+
+          /** Mira: é aqui que os toques automáticos caem. */
+          class TargetView(c: Context) : View(c) {
+              var editing = false
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+
+              private fun ring(cv: Canvas, r: Float, w: Float, col: Int) {
+                  p.style = Paint.Style.STROKE
+                  p.strokeCap = Paint.Cap.ROUND
+                  p.strokeWidth = w
+                  p.color = col
+                  cv.drawCircle(r, r, r * 0.8f, p)
+                  cv.drawLine(r, r * 0.08f, r, r * 0.45f, p)
+                  cv.drawLine(r, r * 1.55f, r, r * 1.92f, p)
+                  cv.drawLine(r * 0.08f, r, r * 0.45f, r, p)
+                  cv.drawLine(r * 1.55f, r, r * 1.92f, r, p)
+              }
+
+              override fun onDraw(cv: Canvas) {
+                  val w = width.toFloat()
+                  val r = w / 2
+                  ring(cv, r, w * 0.11f, Color.BLACK)
+                  ring(cv, r, w * 0.06f, Color.parseColor("#FF3B6B"))
+                  p.style = Paint.Style.FILL
+                  p.color = Color.parseColor("#FF3B6B")
+                  cv.drawCircle(r, r, w * 0.05f, p)
+                  if (editing) {
+                      p.style = Paint.Style.STROKE
+                      p.strokeWidth = 4f
+                      p.color = Color.parseColor("#FFD400")
+                      p.pathEffect = DashPathEffect(floatArrayOf(14f, 10f), 0f)
+                      cv.drawRect(2f, 2f, w - 2f, w - 2f, p)
+                      p.pathEffect = null
+                  }
+              }
+          }
+          EOF
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">Toque Turbo</string>
+              <string name="service_desc">Mostra um botão e uma mira por cima dos apps escolhidos e faz toques automáticos na mira enquanto você usa o botão. Só vê qual app está aberto, não lê o conteúdo das telas.</string>
+          </resources>
+          EOF
+          cat > app/src/main/res/xml/accessibility_service_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault"
+              android:canRetrieveWindowContent="false"
+              android:canPerformGestures="true"
+              android:notificationTimeout="0"
+              android:description="@string/service_desc" />
+          EOF
+
+      - name: Compilar
+        run: |
+          gradle assembleDebug --no-daemon --console=plain > build.log 2>&1 || {
+            echo "=== ERROS DE COMPILACAO (me mande um print disto) ==="
+            grep -E "^e: |What went wrong" -A3 build.log | head -60
+            exit 1
+          }
+          echo "Compilou sem erros."
+
+      - name: Publicar o APK em Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "turbo-${{ github.run_number }}" app/build/outputs/apk/debug/app-debug.apk \
+            --title "Toque Turbo #${{ github.run_number }}" \
+            --notes "Baixe o app-debug.apk e instale no celular."
