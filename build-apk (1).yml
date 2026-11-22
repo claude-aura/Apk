@@ -1,0 +1,609 @@
+# COLE ESTE ARQUIVO EM: .github/workflows/build-apk.yml (num repositório novo do GitHub)
+# Ele monta o projeto Android sozinho, compila na nuvem e publica o APK em "Releases".
+name: Gerar APK do Clique Sonoro
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Criar o projeto Android
+        run: |
+          mkdir -p app app/src/main app/src/main/java/com/cliquesonoro app/src/main/res/values app/src/main/res/xml
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "CliqueSonoro"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g
+          kotlin.code.style=official
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.cliquesonoro"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.cliquesonoro"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.VIBRATE" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@android:drawable/ic_btn_speak_now"
+                  android:label="@string/app_name">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".ClickService"
+                      android:exported="false"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/res/xml/accessibility_service_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeViewLongClicked"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault"
+              android:canRetrieveWindowContent="false"
+              android:notificationTimeout="0"
+              android:description="@string/service_desc" />
+          EOF
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">Clique Sonoro</string>
+              <string name="service_desc">Toca um som quando você toca na tela, em qualquer app. Não lê o conteúdo das telas.</string>
+          </resources>
+          EOF
+          cat > app/src/main/java/com/cliquesonoro/SoundEngine.kt <<'EOF'
+          package com.cliquesonoro
+
+          import android.content.Context
+          import android.content.SharedPreferences
+          import android.media.AudioAttributes
+          import android.media.MediaPlayer
+          import android.media.SoundPool
+          import java.io.File
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
+          import kotlin.math.PI
+          import kotlin.math.exp
+          import kotlin.math.pow
+          import kotlin.math.sin
+
+          /** Configurações salvas no aparelho. */
+          object Prefs {
+              private lateinit var sp: SharedPreferences
+
+              fun init(c: Context) {
+                  if (!::sp.isInitialized) sp = c.applicationContext.getSharedPreferences("cfg", Context.MODE_PRIVATE)
+              }
+
+              var enabled: Boolean
+                  get() = sp.getBoolean("enabled", true)
+                  set(v) = sp.edit().putBoolean("enabled", v).apply()
+              var mute: Boolean
+                  get() = sp.getBoolean("mute", false)
+                  set(v) = sp.edit().putBoolean("mute", v).apply()
+              var caption: Boolean
+                  get() = sp.getBoolean("caption", true)
+                  set(v) = sp.edit().putBoolean("caption", v).apply()
+              var vibrate: Boolean
+                  get() = sp.getBoolean("vibrate", false)
+                  set(v) = sp.edit().putBoolean("vibrate", v).apply()
+              var master: Int
+                  get() = sp.getInt("master", 80)
+                  set(v) = sp.edit().putInt("master", v).apply()
+              var maxHold: Int
+                  get() = sp.getInt("maxhold", 4)
+                  set(v) = sp.edit().putInt("maxhold", v).apply()
+
+              fun on(slot: String) = sp.getBoolean("on_$slot", slot == "click")
+              fun setOn(slot: String, v: Boolean) = sp.edit().putBoolean("on_$slot", v).apply()
+              fun vol(slot: String) = sp.getInt("vol_$slot", when (slot) { "click" -> 80; "hold" -> 60; else -> 70 })
+              fun setVol(slot: String, v: Int) = sp.edit().putInt("vol_$slot", v).apply()
+              fun label(slot: String): String = sp.getString("label_$slot", "") ?: ""
+              fun setLabel(slot: String, v: String) = sp.edit().putString("label_$slot", v).apply()
+          }
+
+          /** Toca os sons. Clique e soltar usam SoundPool (curtos, sobrepõem). Segurar usa MediaPlayer em loop. */
+          object SoundEngine {
+              private const val RATE = 44100
+              private val SLOTS = listOf("click", "hold", "rel")
+              private val DEFAULT_FILES = mapOf("click" to "pop.wav", "hold" to "hum.wav", "rel" to "tick.wav")
+              private val attrs = AudioAttributes.Builder()
+                  .setUsage(AudioAttributes.USAGE_MEDIA)
+                  .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                  .build()
+
+              private lateinit var ctx: Context
+              private var pool: SoundPool? = null
+              private val ids = HashMap<String, Int>()
+              private var hold: MediaPlayer? = null
+
+              fun init(c: Context) {
+                  if (pool != null) return
+                  ctx = c.applicationContext
+                  Prefs.init(ctx)
+                  makeDefaults()
+                  pool = SoundPool.Builder().setMaxStreams(16).setAudioAttributes(attrs).build()
+                  for (s in SLOTS) reload(s)
+              }
+
+              private fun file(slot: String): File {
+                  val custom = File(ctx.filesDir, "$slot.snd")
+                  return if (custom.exists()) custom else File(ctx.filesDir, DEFAULT_FILES.getValue(slot))
+              }
+
+              fun reload(slot: String) {
+                  val p = pool ?: return
+                  ids[slot]?.let { p.unload(it) }
+                  ids[slot] = p.load(file(slot).path, 1)
+              }
+
+              private fun volume(slot: String) = Prefs.vol(slot) / 100f * Prefs.master / 100f
+
+              fun playOnce(slot: String, force: Boolean = false) {
+                  if (!force && !Prefs.on(slot)) return
+                  val id = ids[slot] ?: return
+                  val v = volume(slot)
+                  pool?.play(id, v, v, 1, 0, 1f)
+              }
+
+              fun startHold(force: Boolean = false) {
+                  if (!force && !Prefs.on("hold")) return
+                  stopHold()
+                  val mp = MediaPlayer()
+                  try {
+                      val v = volume("hold")
+                      mp.setAudioAttributes(attrs)
+                      FileInputStream(file("hold")).use { mp.setDataSource(it.fd) }
+                      mp.isLooping = true
+                      mp.setVolume(v, v)
+                      mp.prepare()
+                      mp.start()
+                      hold = mp
+                  } catch (e: Exception) {
+                      mp.release()
+                      hold = null
+                  }
+              }
+
+              fun stopHold() {
+                  hold?.let {
+                      try { if (it.isPlaying) it.stop() } catch (_: Exception) { }
+                      it.release()
+                  }
+                  hold = null
+              }
+
+              // ---- sons padrão gerados no primeiro uso (mesma síntese da versão de PC)
+              private fun wav(name: String, n: Int, f: (Int) -> Double) {
+                  val out = File(ctx.filesDir, name)
+                  if (out.exists()) return
+                  val data = ByteArray(n * 2)
+                  for (i in 0 until n) {
+                      val s = (f(i).coerceIn(-1.0, 1.0) * 32767).toInt()
+                      data[2 * i] = (s and 0xFF).toByte()
+                      data[2 * i + 1] = ((s shr 8) and 0xFF).toByte()
+                  }
+                  FileOutputStream(out).use { o ->
+                      fun le(v: Int, bytes: Int) { for (k in 0 until bytes) o.write((v shr (8 * k)) and 0xFF) }
+                      o.write("RIFF".toByteArray()); le(36 + data.size, 4)
+                      o.write("WAVEfmt ".toByteArray()); le(16, 4); le(1, 2); le(1, 2)
+                      le(RATE, 4); le(RATE * 2, 4); le(2, 2); le(16, 2)
+                      o.write("data".toByteArray()); le(data.size, 4); o.write(data)
+                  }
+              }
+
+              private fun makeDefaults() {
+                  var ph = 0.0
+                  val nPop = (RATE * 0.09).toInt()
+                  wav("pop.wav", nPop) { i ->
+                      val t = i.toDouble() / nPop
+                      ph += 2 * PI * (650 * (140.0 / 650).pow(t)) / RATE
+                      sin(ph) * exp(-5 * t) * 0.8
+                  }
+                  val nTick = (RATE * 0.03).toInt()
+                  wav("tick.wav", nTick) { i ->
+                      (if (sin(2 * PI * 1400 * i / RATE) >= 0) 1.0 else -1.0) * exp(-4.0 * i / nTick) * 0.35
+                  }
+                  // 0,5 s com ciclos inteiros: o loop não estala
+                  wav("hum.wav", RATE / 2) { i ->
+                      val t = i.toDouble() / RATE
+                      0.3 * (sin(2 * PI * 110 * t) + 0.5 * sin(2 * PI * 220 * t) + 0.25 * sin(2 * PI * 330 * t))
+                  }
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/cliquesonoro/ClickService.kt <<'EOF'
+          package com.cliquesonoro
+
+          import android.accessibilityservice.AccessibilityService
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.VibrationEffect
+          import android.os.Vibrator
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.WindowManager.LayoutParams as LP
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.TextView
+
+          /**
+           * Como funciona (o Android não entrega toques de outros apps para ninguém):
+           *  - CLIQUE: uma janelinha invisível de 1x1 px, com FLAG_WATCH_OUTSIDE_TOUCH, recebe ACTION_OUTSIDE
+           *    a cada toque que cai fora dela, ou seja, em qualquer app.
+           *  - SEGURAR: o serviço de acessibilidade avisa quando o Android reconhece um TOQUE LONGO.
+           *    O som de segurar toca em loop até o próximo toque ou até o tempo máximo.
+           *  - SOLTAR: toca quando o som de segurar termina.
+           */
+          class ClickService : AccessibilityService() {
+              private val ui = Handler(Looper.getMainLooper())
+              private var wm: WindowManager? = null
+              private var catcher: View? = null
+              private var cap: TextView? = null
+              private var holding = false
+              private val hideCap = Runnable { cap?.visibility = View.GONE }
+              private val autoStop = Runnable { endHold() }
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  SoundEngine.init(this)
+                  val m = getSystemService(WINDOW_SERVICE) as WindowManager
+                  wm = m
+
+                  val c = View(this)
+                  c.setOnTouchListener { _, e -> if (e.actionMasked == MotionEvent.ACTION_OUTSIDE) onTap(); false }
+                  val lp = LP(1, 1, LP.TYPE_ACCESSIBILITY_OVERLAY,
+                      LP.FLAG_NOT_FOCUSABLE or LP.FLAG_NOT_TOUCH_MODAL or LP.FLAG_WATCH_OUTSIDE_TOUCH,
+                      PixelFormat.TRANSLUCENT)
+                  lp.gravity = Gravity.TOP or Gravity.START
+                  m.addView(c, lp)
+                  catcher = c
+
+                  val t = TextView(this)
+                  t.setPadding(48, 20, 48, 20)
+                  t.setTextColor(Color.WHITE)
+                  t.textSize = 18f
+                  t.typeface = Typeface.DEFAULT_BOLD
+                  t.background = GradientDrawable().apply { cornerRadius = 100f; setColor(Color.parseColor("#6D4AFF")) }
+                  t.visibility = View.GONE
+                  val clp = LP(LP.WRAP_CONTENT, LP.WRAP_CONTENT, LP.TYPE_ACCESSIBILITY_OVERLAY,
+                      LP.FLAG_NOT_FOCUSABLE or LP.FLAG_NOT_TOUCHABLE, PixelFormat.TRANSLUCENT)
+                  clp.gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                  clp.y = 180
+                  m.addView(t, clp)
+                  cap = t
+              }
+
+              private fun active() = Prefs.enabled && !Prefs.mute
+
+              private fun onTap() {
+                  if (!active()) return
+                  if (holding) endHold() // um toque novo significa que o anterior já soltou
+                  SoundEngine.playOnce("click")
+                  show("🔊 clique")
+                  buzz(12)
+              }
+
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {
+                  if (e == null || !active()) return
+                  if (e.eventType == AccessibilityEvent.TYPE_VIEW_LONG_CLICKED && Prefs.on("hold") && !holding) {
+                      holding = true
+                      SoundEngine.startHold()
+                      show("🔁 segurando")
+                      buzz(30)
+                      ui.postDelayed(autoStop, Prefs.maxHold * 1000L)
+                  }
+              }
+
+              private fun endHold() {
+                  if (!holding) return
+                  holding = false
+                  ui.removeCallbacks(autoStop)
+                  SoundEngine.stopHold()
+                  if (active()) {
+                      SoundEngine.playOnce("rel")
+                      if (Prefs.on("rel")) show("🔈 soltou")
+                  }
+              }
+
+              private fun show(text: String) {
+                  val v = cap ?: return
+                  if (!Prefs.caption) return
+                  v.text = text
+                  v.visibility = View.VISIBLE
+                  ui.removeCallbacks(hideCap)
+                  ui.postDelayed(hideCap, 650)
+              }
+
+              @Suppress("DEPRECATION")
+              private fun buzz(ms: Long) {
+                  if (!Prefs.vibrate) return
+                  try {
+                      val vib = getSystemService(VIBRATOR_SERVICE) as Vibrator
+                      vib.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
+                  } catch (_: Exception) { }
+              }
+
+              override fun onInterrupt() {
+                  endHold()
+              }
+
+              override fun onDestroy() {
+                  ui.removeCallbacksAndMessages(null)
+                  SoundEngine.stopHold()
+                  try { catcher?.let { wm?.removeView(it) } } catch (_: Exception) { }
+                  try { cap?.let { wm?.removeView(it) } } catch (_: Exception) { }
+                  super.onDestroy()
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/cliquesonoro/MainActivity.kt <<'EOF'
+          package com.cliquesonoro
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Typeface
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.OpenableColumns
+          import android.provider.Settings
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.Switch
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.io.File
+          import java.io.FileOutputStream
+
+          class MainActivity : Activity() {
+              private val labels = HashMap<String, TextView>()
+              private var pending = ""
+              private lateinit var status: TextView
+
+              private fun dp(x: Int) = (x * resources.displayMetrics.density).toInt()
+
+              private fun LinearLayout.add(v: View) {
+                  addView(v, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                      .apply { topMargin = dp(8) })
+              }
+
+              private fun label(s: String, size: Float, bold: Boolean) = TextView(this).apply {
+                  text = s
+                  if (size > 0f) textSize = size
+                  if (bold) setTypeface(typeface, Typeface.BOLD)
+              }
+
+              private fun button(s: String, onClick: () -> Unit) = Button(this).apply {
+                  text = s
+                  minHeight = dp(48)
+                  setOnClickListener { onClick() }
+              }
+
+              private fun toggle(s: String, init: Boolean, on: (Boolean) -> Unit) = Switch(this).apply {
+                  text = s
+                  isChecked = init
+                  minHeight = dp(48)
+                  setOnCheckedChangeListener { _, c -> on(c) }
+              }
+
+              private fun slider(name: String, lo: Int, hi: Int, v: Int, unit: String, on: (Int) -> Unit): LinearLayout {
+                  val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  val t = label("$name: $v$unit", 0f, false)
+                  val s = SeekBar(this)
+                  s.min = lo
+                  s.max = hi
+                  s.progress = v
+                  s.contentDescription = name
+                  s.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                          t.text = "$name: $p$unit"
+                          on(p)
+                      }
+                      override fun onStartTrackingTouch(sb: SeekBar?) {}
+                      override fun onStopTrackingTouch(sb: SeekBar?) {}
+                  })
+                  box.addView(t)
+                  box.addView(s)
+                  return box
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  SoundEngine.init(this)
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(16), dp(16), dp(16), dp(32))
+                  }
+                  setContentView(ScrollView(this).apply { fitsSystemWindows = true; addView(col) })
+
+                  col.add(label("Clique Sonoro 🔊", 26f, true))
+                  col.add(label("Toca um som a cada toque na tela, em qualquer app. Precisa do serviço de acessibilidade ligado.", 0f, false))
+                  status = label("", 0f, true)
+                  col.add(status)
+                  col.add(button("Abrir ajustes de acessibilidade") {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  })
+                  col.add(toggle("Ligado", Prefs.enabled) { Prefs.enabled = it; if (!it) SoundEngine.stopHold() })
+                  col.add(toggle("Silenciar tudo", Prefs.mute) { Prefs.mute = it; if (it) SoundEngine.stopHold() })
+                  col.add(toggle("Legenda na tela quando tocar", Prefs.caption) { Prefs.caption = it })
+                  col.add(toggle("Vibrar junto", Prefs.vibrate) { Prefs.vibrate = it })
+                  col.add(slider("Volume geral", 0, 100, Prefs.master, "%") { Prefs.master = it })
+                  col.add(slider("Tempo máximo do som de segurar", 1, 10, Prefs.maxHold, " s") { Prefs.maxHold = it })
+
+                  val slots = listOf(
+                      Triple("click", "Ao clicar", "Toca a cada toque na tela, em qualquer app."),
+                      Triple("hold", "Ao segurar", "Toca em loop quando o Android reconhece um toque longo. Para no próximo toque ou no tempo máximo."),
+                      Triple("rel", "Ao soltar", "Toca quando o som de segurar termina."))
+                  for ((k, title, desc) in slots) {
+                      col.add(label(title, 20f, true))
+                      col.add(label(desc, 0f, false))
+                      col.add(toggle("Ativo", Prefs.on(k)) { Prefs.setOn(k, it) })
+                      val l = label("", 0f, false)
+                      labels[k] = l
+                      col.add(l)
+                      refresh(k)
+                      col.add(button("Escolher áudio ou vídeo…") { pick(k) })
+                      col.add(button("Voltar ao som padrão") { reset(k) })
+                      col.add(button("Testar") { test(k) })
+                      col.add(slider("Volume deste som", 0, 100, Prefs.vol(k), "%") { Prefs.setVol(k, it) })
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  status.text = if (serviceOn()) "Serviço: ATIVO ✔"
+                  else "Serviço: DESATIVADO. Abra os ajustes de acessibilidade e ligue o Clique Sonoro."
+              }
+
+              private fun serviceOn(): Boolean {
+                  val s = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: return false
+                  return s.contains(packageName) && s.contains("ClickService")
+              }
+
+              private fun refresh(k: String) {
+                  val custom = File(filesDir, "$k.snd").exists()
+                  labels[k]?.text = "Som atual: " + if (custom) Prefs.label(k) else "padrão"
+              }
+
+              private fun test(k: String) {
+                  if (k == "hold") {
+                      SoundEngine.startHold(true)
+                      Handler(Looper.getMainLooper()).postDelayed({ SoundEngine.stopHold() }, 1200)
+                  } else SoundEngine.playOnce(k, true)
+              }
+
+              private fun reset(k: String) {
+                  File(filesDir, "$k.snd").delete()
+                  Prefs.setLabel(k, "")
+                  SoundEngine.reload(k)
+                  refresh(k)
+              }
+
+              private fun pick(k: String) {
+                  pending = k
+                  val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                      addCategory(Intent.CATEGORY_OPENABLE)
+                      type = "*/*"
+                      putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("audio/*", "video/*"))
+                  }
+                  @Suppress("DEPRECATION")
+                  startActivityForResult(i, 7)
+              }
+
+              private fun nameOf(u: Uri): String {
+                  contentResolver.query(u, null, null, null, null)?.use { c ->
+                      val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                      if (i >= 0 && c.moveToFirst()) return c.getString(i)
+                  }
+                  return "arquivo"
+              }
+
+              @Suppress("DEPRECATION")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode != 7 || resultCode != RESULT_OK) return
+                  val uri = data?.data ?: return
+                  try {
+                      contentResolver.openInputStream(uri)?.use { inp ->
+                          FileOutputStream(File(filesDir, "$pending.snd")).use { out -> inp.copyTo(out) }
+                      }
+                      Prefs.setLabel(pending, nameOf(uri))
+                      SoundEngine.reload(pending)
+                      refresh(pending)
+                      Toast.makeText(this, "Pronto!", Toast.LENGTH_SHORT).show()
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Não consegui abrir esse arquivo.", Toast.LENGTH_LONG).show()
+                  }
+              }
+          }
+          EOF
+
+      - name: Compilar
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Publicar o APK em Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "apk-${{ github.run_number }}" app/build/outputs/apk/debug/app-debug.apk \
+            --title "Clique Sonoro #${{ github.run_number }}" \
+            --notes "Baixe o app-debug.apk e instale no celular."
