@@ -1,0 +1,850 @@
+# ClickerIntheScreen: este arquivo SOZINHO cria o app Android inteiro, compila na nuvem
+# e publica o APK em "Releases". Coloque em .github/workflows/build.yml (pode apagar o resto do repo).
+name: Gerar APK do ClickerIntheScreen
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Criar o projeto Android
+        run: |
+          rm -rf app settings.gradle.kts build.gradle.kts gradle.properties
+          mkdir -p app app/src/main app/src/main/java/com/clickerinthescreen app/src/main/res/values app/src/main/res/xml
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "ClickerIntheScreen"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g
+          kotlin.code.style=official
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.clickerinthescreen"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.clickerinthescreen"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:allowBackup="true"
+                  android:icon="@android:drawable/star_big_on"
+                  android:label="@string/app_name">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".ClickerService"
+                      android:exported="false"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/res/xml/accessibility_service_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault"
+              android:canRetrieveWindowContent="false"
+              android:notificationTimeout="0"
+              android:description="@string/service_desc" />
+          EOF
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">ClickerIntheScreen</string>
+              <string name="service_desc">Mostra o clicker flutuante por cima dos outros apps e, no modo espiao, conta seus toques. Nao le o conteudo das telas.</string>
+          </resources>
+          EOF
+          cat > app/src/main/java/com/clickerinthescreen/Prefs.kt <<'EOF'
+          package com.clickerinthescreen
+
+          import android.content.Context
+          import android.content.SharedPreferences
+          import android.graphics.Color
+
+          /** Configurações salvas no aparelho. */
+          object Prefs {
+              private lateinit var sp: SharedPreferences
+
+              fun init(c: Context) {
+                  if (!::sp.isInitialized) sp = c.applicationContext.getSharedPreferences("cits", Context.MODE_PRIVATE)
+              }
+
+              private fun bool(k: String, d: Boolean) = sp.getBoolean(k, d)
+              private fun putBool(k: String, v: Boolean) = sp.edit().putBoolean(k, v).apply()
+              private fun int(k: String, d: Int) = sp.getInt(k, d)
+              private fun putInt(k: String, v: Int) = sp.edit().putInt(k, v).apply()
+
+              var overlayOn: Boolean
+                  get() = bool("overlay", false)
+                  set(v) = putBool("overlay", v)
+              var spyOn: Boolean
+                  get() = bool("spy", false)
+                  set(v) = putBool("spy", v)
+              var limitSec: Int                       // 0 = sem limite
+                  get() = int("limit", 2)
+                  set(v) = putInt("limit", v)
+              var textSizeSp: Int
+                  get() = int("tsize", 28)
+                  set(v) = putInt("tsize", v)
+              var textColor: Int
+                  get() = int("tcolor", Color.WHITE)
+                  set(v) = putInt("tcolor", v)
+              var showCounter: Boolean
+                  get() = bool("showcounter", true)
+                  set(v) = putBool("showcounter", v)
+              var showCps: Boolean
+                  get() = bool("showcps", true)
+                  set(v) = putBool("showcps", v)
+              var sizeDp: Int
+                  get() = int("size", 140)
+                  set(v) = putInt("size", v)
+              var clickMs: Int                        // quanto tempo a imagem de clique fica na tela
+                  get() = int("clickms", 150)
+                  set(v) = putInt("clickms", v)
+              var x: Int
+                  get() = int("x", -1)
+                  set(v) = putInt("x", v)
+              var y: Int
+                  get() = int("y", -1)
+                  set(v) = putInt("y", v)
+
+              fun setPos(px: Int, py: Int) {
+                  sp.edit().putInt("x", px).putInt("y", py).apply()
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/clickerinthescreen/ImageStore.kt <<'EOF'
+          package com.clickerinthescreen
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.net.Uri
+          import java.io.File
+          import java.io.FileOutputStream
+
+          /** Três slots de imagem: 0 = parada, 1 = clique, 2 = segurando. */
+          object ImageStore {
+              private val names = arrayOf("idle.img", "click.img", "hold.img")
+
+              private fun file(c: Context, slot: Int) = File(c.filesDir, names[slot])
+
+              fun save(c: Context, uri: Uri, slot: Int): Boolean {
+                  return try {
+                      c.contentResolver.openInputStream(uri)?.use { inp ->
+                          FileOutputStream(file(c, slot)).use { out -> inp.copyTo(out) }
+                      }
+                      true
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
+
+              fun remove(c: Context, slot: Int) {
+                  file(c, slot).delete()
+              }
+
+              /** Lê a imagem reduzindo se for enorme. */
+              fun load(c: Context, slot: Int): Bitmap? {
+                  val f = file(c, slot)
+                  if (!f.exists()) return null
+                  return try {
+                      val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                      BitmapFactory.decodeFile(f.path, o)
+                      var s = 1
+                      while (o.outWidth / s > 1024 || o.outHeight / s > 1024) s *= 2
+                      BitmapFactory.decodeFile(f.path, BitmapFactory.Options().apply { inSampleSize = s })
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/clickerinthescreen/ClickEngine.kt <<'EOF'
+          package com.clickerinthescreen
+
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+
+          /** Estados IDLE -> CLICK -> HOLD e contagem por rodada com limite de tempo. */
+          class ClickEngine(private val onChange: () -> Unit) {
+
+              enum class State { IDLE, CLICK, HOLD }
+
+              var state = State.IDLE
+                  private set
+              var count = 0
+                  private set
+              var running = false
+                  private set
+              var finished = false
+                  private set
+              var elapsedMs = 0L
+                  private set
+              var limitMs = 0L
+                  private set
+              var onFinished: ((Int, Float) -> Unit)? = null
+
+              val cps: Float get() = if (limitMs > 0) count * 1000f / limitMs else 0f
+
+              private val h = Handler(Looper.getMainLooper())
+              private var startAt = 0L
+              private var finishedAt = 0L
+              private var isDown = false
+              private var counted = false
+
+              private val holdR = Runnable {
+                  if (isDown && state == State.CLICK) { state = State.HOLD; onChange() }
+              }
+              private val releaseR = Runnable {
+                  if (!isDown && state != State.IDLE) { state = State.IDLE; onChange() }
+              }
+              private val tickR = object : Runnable {
+                  override fun run() {
+                      elapsedMs = SystemClock.uptimeMillis() - startAt
+                      if (limitMs > 0 && elapsedMs >= limitMs) { finish(); return }
+                      onChange()
+                      h.postDelayed(this, 50)
+                  }
+              }
+
+              fun down(limitSec: Int) {
+                  val now = SystemClock.uptimeMillis()
+                  h.removeCallbacks(releaseR); h.removeCallbacks(holdR)
+                  isDown = true; counted = false
+                  if (finished && now - finishedAt >= LOCKOUT_MS) clear()
+                  if (!finished) {
+                      if (!running) {
+                          running = true; count = 0
+                          limitMs = limitSec * 1000L
+                          startAt = now; elapsedMs = 0
+                          h.post(tickR)
+                      }
+                      count++; counted = true
+                  }
+                  state = State.CLICK
+                  h.postDelayed(holdR, HOLD_MS)
+                  onChange()
+              }
+
+              fun up(releaseMs: Int) {
+                  isDown = false
+                  h.removeCallbacks(holdR); h.removeCallbacks(releaseR)
+                  h.postDelayed(releaseR, releaseMs.toLong())
+              }
+
+              /** Toque sem "soltar" (modo espião): conta e mostra o clique por [releaseMs]. */
+              fun tap(limitSec: Int, releaseMs: Int) {
+                  down(limitSec)
+                  up(releaseMs)
+              }
+
+              /** O toque virou arrasto: desfaz a contagem desse toque. */
+              fun cancelTouch() {
+                  h.removeCallbacks(holdR)
+                  isDown = false
+                  if (counted) {
+                      counted = false; count--
+                      if (count <= 0 && running) clear()
+                  }
+                  state = State.IDLE
+                  onChange()
+              }
+
+              fun reset() { clear(); onChange() }
+
+              fun destroy() = h.removeCallbacksAndMessages(null)
+
+              private fun clear() {
+                  h.removeCallbacks(tickR)
+                  running = false; finished = false
+                  count = 0; elapsedMs = 0
+                  state = State.IDLE
+              }
+
+              private fun finish() {
+                  h.removeCallbacks(tickR); h.removeCallbacks(holdR)
+                  running = false; finished = true
+                  finishedAt = SystemClock.uptimeMillis()
+                  elapsedMs = limitMs
+                  state = State.IDLE
+                  onFinished?.invoke(count, cps)
+                  onChange()
+              }
+
+              private companion object {
+                  const val HOLD_MS = 220L       // tempo pra virar "segurando"
+                  const val LOCKOUT_MS = 1000L   // ignora toques logo após o fim da rodada
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/clickerinthescreen/ClickerView.kt <<'EOF'
+          package com.clickerinthescreen
+
+          import android.annotation.SuppressLint
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.RectF
+          import android.graphics.Typeface
+          import android.util.TypedValue
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewConfiguration
+          import kotlin.math.hypot
+
+          /** View única (app e overlay): imagem parada/clique/segurando em cima, contador embaixo. */
+          class ClickerView(ctx: Context, private val engine: ClickEngine) : View(ctx) {
+
+              private var idle: Bitmap? = null
+              private var click: Bitmap? = null
+              private var hold: Bitmap? = null
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val rect = RectF()
+              private var text = "0"
+
+              init {
+                  engine.onFinished = { c, cps ->
+                      announceForAccessibility(String.format("Tempo esgotado. %d cliques, %.1f por segundo.", c, cps))
+                  }
+                  reload()
+              }
+
+              fun textPx(): Float =
+                  TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, Prefs.textSizeSp.toFloat(), resources.displayMetrics)
+
+              fun blockHeightPx(): Int = if (Prefs.showCounter) (textPx() * 1.5f).toInt() else 0
+
+              fun reload() {
+                  idle = ImageStore.load(context, 0)
+                  click = ImageStore.load(context, 1)
+                  hold = ImageStore.load(context, 2)
+                  refresh()
+              }
+
+              fun refresh() {
+                  text = when {
+                      engine.finished ->
+                          if (Prefs.showCps) String.format("%d cliques • %.1f CPS", engine.count, engine.cps)
+                          else String.format("%d cliques", engine.count)
+                      engine.running && engine.limitMs > 0 ->
+                          String.format("%d • %.1fs", engine.count, (engine.limitMs - engine.elapsedMs).coerceAtLeast(0) / 1000f)
+                      else -> engine.count.toString()
+                  }
+                  if (!engine.running) contentDescription = "Área de clique. $text"
+                  invalidate()
+              }
+
+              override fun onDraw(c: Canvas) {
+                  val w = width.toFloat()
+                  val block = blockHeightPx().toFloat()
+                  val side = minOf(w, height - block).coerceAtLeast(0f)
+                  val left = (w - side) / 2f
+                  val bmp = when (engine.state) {
+                      ClickEngine.State.IDLE -> idle
+                      ClickEngine.State.CLICK -> click ?: idle
+                      ClickEngine.State.HOLD -> hold ?: click ?: idle
+                  }
+                  if (bmp != null) {
+                      val r = minOf(side / bmp.width, side / bmp.height)
+                      val dw = bmp.width * r
+                      val dh = bmp.height * r
+                      rect.set(left + (side - dw) / 2, (side - dh) / 2, left + (side + dw) / 2, (side + dh) / 2)
+                      p.style = Paint.Style.FILL
+                      c.drawBitmap(bmp, null, rect, p)
+                  } else {
+                      drawDefault(c, left, side)
+                  }
+                  if (Prefs.showCounter) drawCounter(c, w, side, block)
+              }
+
+              private fun drawDefault(c: Canvas, left: Float, side: Float) {
+                  val cx = left + side / 2
+                  val cy = side / 2
+                  val r = side * 0.4f
+                  when (engine.state) {
+                      ClickEngine.State.IDLE -> {
+                          p.style = Paint.Style.STROKE; p.strokeWidth = side * 0.06f; p.color = 0xFF8AB4F8.toInt()
+                          c.drawCircle(cx, cy, r, p)
+                      }
+                      ClickEngine.State.CLICK -> {
+                          p.style = Paint.Style.FILL; p.color = 0xFF8AB4F8.toInt()
+                          c.drawCircle(cx, cy, r, p)
+                      }
+                      ClickEngine.State.HOLD -> {
+                          p.style = Paint.Style.FILL; p.color = 0xFFF28B82.toInt()
+                          c.drawCircle(cx, cy, r, p)
+                          p.style = Paint.Style.STROKE; p.strokeWidth = side * 0.04f; p.color = Color.WHITE
+                          c.drawCircle(cx, cy, r * 0.65f, p)
+                      }
+                  }
+              }
+
+              private fun drawCounter(c: Canvas, w: Float, top: Float, block: Float) {
+                  var ts = textPx()
+                  p.typeface = Typeface.DEFAULT_BOLD
+                  p.textAlign = Paint.Align.CENTER
+                  p.textSize = ts
+                  while (p.measureText(text) > w - 8f && ts > 10f) { ts *= 0.92f; p.textSize = ts }
+                  val y = top + block * 0.5f + ts * 0.35f
+                  p.strokeJoin = Paint.Join.ROUND
+                  p.style = Paint.Style.STROKE; p.strokeWidth = ts * 0.16f; p.color = Color.BLACK
+                  c.drawText(text, w / 2, y, p)
+                  p.style = Paint.Style.FILL; p.color = Prefs.textColor
+                  c.drawText(text, w / 2, y, p)
+                  p.typeface = Typeface.DEFAULT
+              }
+
+              /**
+               * Toque = clique, segurar = imagem "segurando". Com [onDrag], arrastar move a view
+               * (e o toque deixa de contar como clique).
+               */
+              @SuppressLint("ClickableViewAccessibility")
+              fun enableTouch(onDrag: ((Float, Float) -> Unit)? = null, onDragEnd: (() -> Unit)? = null) {
+                  val slop = ViewConfiguration.get(context).scaledTouchSlop * 2
+                  var sx = 0f; var sy = 0f; var lx = 0f; var ly = 0f
+                  var dragging = false
+                  setOnTouchListener { v, e ->
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> {
+                              v.parent?.requestDisallowInterceptTouchEvent(true)
+                              sx = e.rawX; sy = e.rawY; lx = sx; ly = sy; dragging = false
+                              engine.down(Prefs.limitSec)
+                          }
+                          MotionEvent.ACTION_MOVE -> if (onDrag != null) {
+                              if (!dragging && hypot(e.rawX - sx, e.rawY - sy) > slop) {
+                                  dragging = true
+                                  engine.cancelTouch()
+                              }
+                              if (dragging) onDrag(e.rawX - lx, e.rawY - ly)
+                              lx = e.rawX; ly = e.rawY
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              if (dragging) onDragEnd?.invoke() else engine.up(Prefs.clickMs)
+                              dragging = false
+                              v.performClick()
+                          }
+                          MotionEvent.ACTION_CANCEL -> {
+                              if (!dragging) engine.up(Prefs.clickMs)
+                              dragging = false
+                          }
+                      }
+                      true
+                  }
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/clickerinthescreen/ClickerService.kt <<'EOF'
+          package com.clickerinthescreen
+
+          import android.accessibilityservice.AccessibilityService
+          import android.graphics.PixelFormat
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.WindowManager.LayoutParams as LP
+          import android.view.accessibility.AccessibilityEvent
+
+          /**
+           * Overlay do clicker (TYPE_ACCESSIBILITY_OVERLAY, não precisa da permissão de sobrepor apps).
+           *  - Modo normal: o clicker recebe seus toques (clique, segurar, arrastar).
+           *  - Modo espião: o clicker vira "fantasma" e uma janela invisível de 1x1 px recebe ACTION_OUTSIDE
+           *    a cada toque em qualquer app. O Android só avisa o INÍCIO do toque, então não dá pra detectar segurar.
+           */
+          class ClickerService : AccessibilityService() {
+              companion object {
+                  var instance: ClickerService? = null
+              }
+
+              private var wm: WindowManager? = null
+              private var catcher: View? = null
+              private var view: ClickerView? = null
+              private lateinit var lp: LP
+              private val engine = ClickEngine { view?.refresh() }
+              private var px = 0
+              private var py = 0
+              private val baseFlags = LP.FLAG_NOT_FOCUSABLE or LP.FLAG_LAYOUT_IN_SCREEN
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  Prefs.init(this)
+                  instance = this
+                  val m = getSystemService(WINDOW_SERVICE) as WindowManager
+                  wm = m
+
+                  val c = View(this)
+                  c.setOnTouchListener { _, e ->
+                      if (e.actionMasked == MotionEvent.ACTION_OUTSIDE) onSpyTap()
+                      false
+                  }
+                  val clp = LP(
+                      1, 1, LP.TYPE_ACCESSIBILITY_OVERLAY,
+                      LP.FLAG_NOT_FOCUSABLE or LP.FLAG_NOT_TOUCH_MODAL or LP.FLAG_WATCH_OUTSIDE_TOUCH,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  clp.gravity = Gravity.TOP or Gravity.START
+                  m.addView(c, clp)
+                  catcher = c
+
+                  val v = ClickerView(this, engine)
+                  v.enableTouch(onDrag = { dx, dy -> move(dx, dy) }, onDragEnd = { Prefs.setPos(px, py) })
+                  lp = LP(100, 100, LP.TYPE_ACCESSIBILITY_OVERLAY, baseFlags, PixelFormat.TRANSLUCENT)
+                  lp.gravity = Gravity.TOP or Gravity.START
+                  m.addView(v, lp)
+                  view = v
+                  refresh(true)
+              }
+
+              /** Relê as configurações. images = true também recarrega as imagens. */
+              fun refresh(images: Boolean = false) {
+                  val v = view ?: return
+                  if (images) v.reload()
+                  val d = resources.displayMetrics
+                  val side = (Prefs.sizeDp * d.density).toInt()
+                  lp.width = if (Prefs.showCounter) maxOf(side, (180 * d.density).toInt()) else side
+                  lp.height = side + v.blockHeightPx()
+                  lp.flags = baseFlags or (if (Prefs.spyOn) LP.FLAG_NOT_TOUCHABLE else 0)
+                  if (Prefs.x < 0 || Prefs.y < 0) {
+                      px = d.widthPixels - lp.width - (16 * d.density).toInt()
+                      py = (180 * d.density).toInt()
+                  } else {
+                      px = Prefs.x
+                      py = Prefs.y
+                  }
+                  v.visibility = if (Prefs.overlayOn) View.VISIBLE else View.GONE
+                  place()
+                  v.refresh()
+              }
+
+              private fun place() {
+                  val v = view ?: return
+                  val m = wm ?: return
+                  val d = resources.displayMetrics
+                  px = px.coerceIn(0, maxOf(0, d.widthPixels - lp.width))
+                  py = py.coerceIn(0, maxOf(0, d.heightPixels - lp.height))
+                  lp.x = px
+                  lp.y = py
+                  try { m.updateViewLayout(v, lp) } catch (_: Exception) { }
+              }
+
+              private fun move(dx: Float, dy: Float) {
+                  px += dx.toInt()
+                  py += dy.toInt()
+                  place()
+              }
+
+              private fun onSpyTap() {
+                  if (!Prefs.overlayOn || !Prefs.spyOn) return
+                  engine.tap(Prefs.limitSec, Prefs.clickMs)
+              }
+
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+
+              override fun onInterrupt() {}
+
+              override fun onDestroy() {
+                  instance = null
+                  engine.destroy()
+                  try { catcher?.let { wm?.removeView(it) } } catch (_: Exception) { }
+                  try { view?.let { wm?.removeView(it) } } catch (_: Exception) { }
+                  super.onDestroy()
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/clickerinthescreen/MainActivity.kt <<'EOF'
+          package com.clickerinthescreen
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.FrameLayout
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.Switch
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+              private val engine = ClickEngine { if (::test.isInitialized) test.refresh() }
+              private lateinit var test: ClickerView
+              private lateinit var status: TextView
+              private val thumbs = ArrayList<ImageView>()
+
+              private fun dp(x: Int) = (x * resources.displayMetrics.density).toInt()
+
+              private fun LinearLayout.add(v: View) {
+                  addView(v, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                      .apply { topMargin = dp(8) })
+              }
+
+              private fun label(s: String, size: Float, bold: Boolean) = TextView(this).apply {
+                  text = s
+                  if (size > 0f) textSize = size
+                  if (bold) setTypeface(typeface, Typeface.BOLD)
+              }
+
+              private fun button(s: String, onClick: () -> Unit) = Button(this).apply {
+                  text = s
+                  minHeight = dp(48)
+                  setOnClickListener { onClick() }
+              }
+
+              private fun toggle(s: String, init: Boolean, on: (Boolean) -> Unit) = Switch(this).apply {
+                  text = s
+                  isChecked = init
+                  minHeight = dp(48)
+                  setOnCheckedChangeListener { _, c -> on(c) }
+              }
+
+              private fun slider(name: String, lo: Int, hi: Int, v: Int, fmt: (Int) -> String, on: (Int) -> Unit): LinearLayout {
+                  val box = LinearLayout(this)
+                  box.orientation = LinearLayout.VERTICAL
+                  val t = label(name + ": " + fmt(v), 0f, false)
+                  val s = SeekBar(this)
+                  s.min = lo
+                  s.max = hi
+                  s.progress = v
+                  s.contentDescription = name
+                  s.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                          t.text = name + ": " + fmt(p)
+                          if (fromUser) on(p)
+                      }
+                      override fun onStartTrackingTouch(sb: SeekBar?) {}
+                      override fun onStopTrackingTouch(sb: SeekBar?) {}
+                  })
+                  box.addView(t)
+                  box.addView(s)
+                  return box
+              }
+
+              /** Aplica mudanças no teste do app e no clicker flutuante. */
+              private fun upd(images: Boolean = false) {
+                  if (images) test.reload() else test.refresh()
+                  ClickerService.instance?.refresh(images)
+              }
+
+              private fun serviceActive(): Boolean {
+                  val s = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: ""
+                  return s.contains("$packageName/") && s.contains("ClickerService")
+              }
+
+              private fun openAccessibility() = startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  Prefs.init(this)
+                  val col = LinearLayout(this)
+                  col.orientation = LinearLayout.VERTICAL
+                  col.setPadding(dp(16), dp(16), dp(16), dp(32))
+                  val scroll = ScrollView(this)
+                  scroll.fitsSystemWindows = true
+                  scroll.addView(col)
+                  setContentView(scroll)
+
+                  col.add(label("ClickerIntheScreen", 26f, true))
+                  col.add(label("Toque na área escura pra testar: toque = clique, segurar = imagem de segurando.", 0f, false))
+                  val box = FrameLayout(this)
+                  box.setBackgroundColor(0xFF202124.toInt())
+                  test = ClickerView(this, engine)
+                  test.enableTouch()
+                  box.addView(test, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+                  col.addView(box, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(300)).apply { topMargin = dp(8) })
+                  col.add(button("Resetar rodada") { engine.reset() })
+
+                  // ---------- imagens ----------
+                  col.add(label("Imagens", 20f, true))
+                  val names = arrayOf("Parada (sem toque)", "Clique", "Segurando (opcional)")
+                  for (i in 0..2) {
+                      val row = LinearLayout(this)
+                      row.orientation = LinearLayout.HORIZONTAL
+                      row.gravity = Gravity.CENTER_VERTICAL
+                      val th = ImageView(this)
+                      th.setBackgroundColor(0x22888888)
+                      th.scaleType = ImageView.ScaleType.FIT_CENTER
+                      th.contentDescription = names[i]
+                      thumbs.add(th)
+                      row.addView(th, LinearLayout.LayoutParams(dp(56), dp(56)))
+                      val tv = label(names[i], 0f, false)
+                      tv.setPadding(dp(12), 0, dp(8), 0)
+                      row.addView(tv, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                      row.addView(button("Escolher") { pick(20 + i) })
+                      row.addView(button("Tirar") { ImageStore.remove(this, i); refreshThumbs(); upd(true) })
+                      col.add(row)
+                  }
+                  col.add(label("Sem imagem escolhida, usa o círculo padrão. Se faltar a de clique ou a de segurando, usa a anterior.", 0f, false))
+
+                  // ---------- contador ----------
+                  col.add(label("Contador", 20f, true))
+                  col.add(slider("Limite da rodada", 0, 30, Prefs.limitSec, { if (it == 0) "sem limite" else "$it s" }) { Prefs.limitSec = it }) 
+                  col.add(slider("Tamanho do texto", 12, 64, Prefs.textSizeSp, { "$it sp" }) { Prefs.textSizeSp = it; upd() })
+                  col.add(slider("Tempo da imagem de clique", 50, 500, Prefs.clickMs, { "$it ms" }) { Prefs.clickMs = it })
+                  col.add(label("Cor do contador", 0f, false))
+                  val crow = LinearLayout(this)
+                  crow.orientation = LinearLayout.HORIZONTAL
+                  val colors = intArrayOf(
+                      0xFFFFFFFF.toInt(), 0xFFFFEB3B.toInt(), 0xFF4CAF50.toInt(),
+                      0xFFF44336.toInt(), 0xFF00BCD4.toInt(), 0xFFE040FB.toInt()
+                  )
+                  for (c in colors) {
+                      val dot = View(this)
+                      val g = GradientDrawable()
+                      g.shape = GradientDrawable.OVAL
+                      g.setColor(c)
+                      g.setStroke(dp(2), 0x88888888.toInt())
+                      dot.background = g
+                      dot.contentDescription = "Cor do contador"
+                      dot.setOnClickListener { Prefs.textColor = c; upd() }
+                      crow.addView(dot, LinearLayout.LayoutParams(dp(40), dp(40)).apply { marginEnd = dp(10) })
+                  }
+                  col.add(crow)
+                  col.add(toggle("Mostrar contador", Prefs.showCounter) { Prefs.showCounter = it; upd() })
+                  col.add(toggle("Mostrar CPS no fim da rodada", Prefs.showCps) { Prefs.showCps = it; upd() })
+
+                  // ---------- clicker flutuante ----------
+                  col.add(label("Clicker flutuante (acessibilidade)", 20f, true))
+                  status = label("", 0f, true)
+                  col.add(status)
+                  col.add(button("Abrir ajustes de acessibilidade") { openAccessibility() })
+                  col.add(toggle("Mostrar clicker flutuante", Prefs.overlayOn) {
+                      Prefs.overlayOn = it
+                      if (it && !serviceActive()) {
+                          Toast.makeText(this, "Ative o ClickerIntheScreen em Acessibilidade", Toast.LENGTH_LONG).show()
+                          openAccessibility()
+                      }
+                      upd()
+                  })
+                  col.add(toggle("Modo espião (experimental)", Prefs.spyOn) { Prefs.spyOn = it; upd() })
+                  col.add(label("Espião: conta toques em qualquer app e o clicker deixa de receber toque (não arrasta). Não detecta segurar. Pra mover o clicker, desligue o espião, arraste e ligue de novo.", 0f, false))
+                  col.add(slider("Tamanho do clicker", 60, 300, Prefs.sizeDp, { "$it dp" }) { Prefs.sizeDp = it; upd() })
+                  col.add(button("Voltar o clicker pra posição inicial") { Prefs.x = -1; Prefs.y = -1; upd() })
+                  col.add(label("Limite do Android: ele avisa quando você TOCA, mas não onde nem quando o dedo sai. No espião, a imagem de clique dura um tempo fixo.", 0f, false))
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  status.text = if (serviceActive()) "Serviço: ATIVO ✔"
+                  else "Serviço: DESATIVADO. Abra os ajustes de acessibilidade e ligue o ClickerIntheScreen."
+                  refreshThumbs()
+              }
+
+              override fun onDestroy() {
+                  engine.destroy()
+                  super.onDestroy()
+              }
+
+              private fun refreshThumbs() {
+                  for (i in 0..2) thumbs[i].setImageBitmap(ImageStore.load(this, i))
+              }
+
+              private fun pick(code: Int) {
+                  val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                  i.addCategory(Intent.CATEGORY_OPENABLE)
+                  i.type = "image/*"
+                  @Suppress("DEPRECATION")
+                  startActivityForResult(i, code)
+              }
+
+              @Suppress("DEPRECATION")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  val slot = requestCode - 20
+                  if (slot !in 0..2 || resultCode != RESULT_OK) return
+                  val uri = data?.data ?: return
+                  if (ImageStore.save(this, uri, slot)) {
+                      refreshThumbs()
+                      upd(true)
+                      Toast.makeText(this, "Pronto!", Toast.LENGTH_SHORT).show()
+                  } else {
+                      Toast.makeText(this, "Não consegui abrir essa imagem.", Toast.LENGTH_LONG).show()
+                  }
+              }
+          }
+          EOF
+
+      - name: Compilar
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Publicar o APK em Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "clicker-${{ github.run_number }}" app/build/outputs/apk/debug/app-debug.apk \
+            --title "ClickerIntheScreen #${{ github.run_number }}" \
+            --notes "Baixe o app-debug.apk e instale no celular."
