@@ -1,0 +1,33 @@
+name: Compilar APK
+on: [push, workflow_dispatch]
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Abrir o ZIP
+        run: |
+          ZIP=$(find . -iname 'geode-instalador*.zip' | head -n 1)
+          if [ -n "$ZIP" ]; then unzip -o "$ZIP"; fi
+          if [ ! -f projeto/settings.gradle ]; then
+            echo "::error::Projeto nao encontrado. Envie o geode-instalador.zip ao repositorio."
+            exit 1
+          fi
+      - name: Compilar
+        run: |
+          set -o pipefail
+          gradle -p projeto assembleDebug 2>&1 | tee build.log || {
+            grep -m 8 -E '^e:|error:|What went wrong' -A 2 build.log | while IFS= read -r l; do echo "::error::$l"; done
+            exit 1
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: instalador-geode-apk
+          path: projeto/app/build/outputs/apk/debug/app-debug.apk
